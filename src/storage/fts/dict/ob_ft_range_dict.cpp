@@ -378,25 +378,49 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+namespace
+{
+// Compare two words with the utf8mb4 binary collation, which is a byte
+// comparison, so that no charset handler is needed on the hot path.
+int cmp_utf8mb4_bin(const ObString &lhs, const ObString &rhs)
+{
+  const int32_t lhs_len = lhs.length();
+  const int32_t rhs_len = rhs.length();
+  const int32_t cmp_len = lhs_len < rhs_len ? lhs_len : rhs_len;
+  int cmp = 0;
+  if (cmp_len > 0) {
+    cmp = MEMCMP(lhs.ptr(), rhs.ptr(), cmp_len);
+  }
+  if (0 == cmp) {
+    cmp = (lhs_len < rhs_len) ? -1 : ((lhs_len > rhs_len) ? 1 : 0);
+  }
+  return cmp;
+}
+} // namespace
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
-  bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+  dict = nullptr;
+  // The ranges are sorted and do not overlap, find the last range whose start
+  // word is not greater than the searched word, then check its end word.
+  int64_t left = 0;
+  int64_t right = range_dicts_.size() - 1;
+  int64_t candidate = -1;
+  while (left <= right) {
+    const int64_t mid = left + ((right - left) >> 1);
+    if (cmp_utf8mb4_bin(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+      candidate = mid;
+      left = mid + 1;
+    } else {
+      right = mid - 1;
     }
   }
-  if (!found) {
-    // not found, dis match
+  if (candidate >= 0 && candidate < range_dicts_.size()
+      && cmp_utf8mb4_bin(range_dicts_[candidate].end_.get_word(), single_word) >= 0) {
+    dict = range_dicts_[candidate].dict_;
+  }
+  if (OB_ISNULL(dict)) {
     ret = OB_ENTRY_NOT_EXIST;
   }
   return ret;

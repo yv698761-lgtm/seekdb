@@ -31,6 +31,9 @@ class ObFTParserProperty;
 
 #define FTS_STOP_WORD_MAX_LENGTH 10
 
+// Tokens shorter than this are lower cased on the stack.
+static const int64_t CASEDOWN_STACK_BUFFER_SIZE = 128;
+
 static const char ob_stop_word_list[][FTS_STOP_WORD_MAX_LENGTH] = {
   "a",
   "about",
