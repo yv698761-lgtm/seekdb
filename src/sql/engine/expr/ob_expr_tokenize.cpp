@@ -39,6 +39,74 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+// Reform of the parser properties and construction of the inner parser name are
+// pure functions of the parser name and of the parser properties given by the
+// user, but they are recalculated on every evaluation of the tokenize
+// expression, which is a noticeable part of the fixed cost of the expression.
+// Keep the last result per thread so that repeated evaluation with the same
+// arguments (the usual case: one expression evaluated for every row of a table,
+// or the build of a fulltext index) skips that work.
+constexpr int64_t TOKENIZE_CACHE_NAME_SIZE = 64;
+constexpr int64_t TOKENIZE_CACHE_PROPS_SIZE = 1024;
+
+struct ParserNameCache
+{
+  ParserNameCache() { reset(); }
+  void reset()
+  {
+    key_len_ = 0;
+    value_len_ = 0;
+  }
+  char key_[TOKENIZE_CACHE_NAME_SIZE];
+  char value_[TOKENIZE_CACHE_NAME_SIZE];
+  int64_t key_len_;
+  int64_t value_len_;
+};
+
+struct ParserPropsCache
+{
+  ParserPropsCache() { reset(); }
+  void reset()
+  {
+    key_parser_len_ = 0;
+    key_props_len_ = 0;
+    value_len_ = 0;
+  }
+  char key_parser_[TOKENIZE_CACHE_NAME_SIZE];
+  char key_props_[TOKENIZE_CACHE_PROPS_SIZE];
+  char value_[TOKENIZE_CACHE_PROPS_SIZE];
+  int64_t key_parser_len_;
+  int64_t key_props_len_;
+  int64_t value_len_;
+};
+
+ParserNameCache &get_parser_name_cache()
+{
+  static thread_local ParserNameCache cache;
+  return cache;
+}
+
+ParserPropsCache &get_parser_props_cache()
+{
+  static thread_local ParserPropsCache cache;
+  return cache;
+}
+
+bool copy_to_cache_buf(const common::ObString &str, char *buf, const int64_t buf_size)
+{
+  bool copiable = str.length() >= 0 && str.length() < buf_size;
+  if (copiable && str.length() > 0) {
+    MEMCPY(buf, str.ptr(), str.length());
+  }
+  if (copiable) {
+    buf[str.length()] = '\0';
+  }
+  return copiable;
+}
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -222,15 +290,35 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
 {
   int ret = OB_SUCCESS;
   storage::ObFTParser parser;
+  ParserNameCache &cache = get_parser_name_cache();
 
   char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
+  if (cache.key_len_ == input_str.length()
+      && cache.value_len_ > 0
+      && (0 == cache.key_len_ || 0 == MEMCMP(cache.key_, input_str.ptr(), input_str.length()))) {
+    // this thread has resolved the same parser name already, copy the result into
+    // the allocator of this param so that the string outlives the cache entry
+    char *cached_name = static_cast<char *>(param.allocator_.alloc(cache.value_len_));
+    if (OB_ISNULL(cached_name)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(cached_name, cache.value_, cache.value_len_);
+      param.parser_name_ = ObString(static_cast<int32_t>(cache.value_len_), cached_name);
+    }
+  } else if (OB_ISNULL(parser_name_buf
                 = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(parser.init(input_str))) {
   } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
   } else {
     param.parser_name_ = ObString::make_string(parser_name_buf);
+    if (copy_to_cache_buf(input_str, cache.key_, TOKENIZE_CACHE_NAME_SIZE)
+        && copy_to_cache_buf(param.parser_name_, cache.value_, TOKENIZE_CACHE_NAME_SIZE)) {
+      cache.key_len_ = input_str.length();
+      cache.value_len_ = param.parser_name_.length();
+    } else {
+      cache.reset();
+    }
   }
   return ret;
 }
@@ -376,14 +464,41 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
+  ParserPropsCache &cache = get_parser_props_cache();
+  const bool cache_hit = cache.key_parser_len_ == parser_name_.length()
+      && cache.key_props_len_ == properties.length()
+      && cache.value_len_ > 0
+      && (0 == cache.key_parser_len_
+          || 0 == MEMCMP(cache.key_parser_, parser_name_.ptr(), parser_name_.length()))
+      && (0 == cache.key_props_len_
+          || 0 == MEMCMP(cache.key_props_, properties.ptr(), properties.length()));
 
-  if (OB_FAIL(parser_properties.init())) {
+  if (cache_hit) {
+    // the same parser name and properties were reformed by this thread already,
+    // copy the result into the allocator of this param so that the string
+    // outlives the cache entry
+    char *cached_props = static_cast<char *>(allocator_.alloc(cache.value_len_));
+    if (OB_ISNULL(cached_props)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(cached_props, cache.value_, cache.value_len_);
+      properties_ = ObString(static_cast<int32_t>(cache.value_len_), cached_props);
+    }
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else if (copy_to_cache_buf(parser_name_, cache.key_parser_, TOKENIZE_CACHE_NAME_SIZE)
+             && copy_to_cache_buf(properties, cache.key_props_, TOKENIZE_CACHE_PROPS_SIZE)
+             && copy_to_cache_buf(properties_, cache.value_, TOKENIZE_CACHE_PROPS_SIZE)) {
+    cache.key_parser_len_ = parser_name_.length();
+    cache.key_props_len_ = properties.length();
+    cache.value_len_ = properties_.length();
+  } else {
+    cache.reset();
   }
 
   return ret;

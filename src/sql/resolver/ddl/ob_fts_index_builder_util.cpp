@@ -22,6 +22,7 @@
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
 #include "data_plane/fts/dict/ob_dic_lock_service.h"
 #include "share/ob_server_struct.h"
+#include "lib/cpu/ob_cpu_topology.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
@@ -90,6 +91,31 @@ bool is_cast_as_array_expr(const ObString &expr_string)
   return get_function_args(expr_string, ObString::make_string("cast"), args)
       && contains_keyword_ci(args, ObString::make_string("as"))
       && args.trim().suffix_match_ci(ObString::make_string("array"));
+}
+
+// Cap of the automatically chosen build parallelism, see get_default_fts_build_parallelism().
+constexpr int64_t MAX_DEFAULT_FTS_BUILD_PARALLELISM = 16;
+
+// Whether the index type is one of the fulltext specific auxiliary tables that
+// dominate the cost of building a fulltext index.
+bool is_fts_build_aux_index(const share::schema::ObIndexType index_type)
+{
+  return share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL == index_type
+      || share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL == index_type;
+}
+
+// Building a fulltext index tokenizes the indexed columns, then sorts and writes
+// the doc-word rows.  Almost all of that work can be executed in parallel, and
+// the statement usually carries no degree of parallelism (the default DDL
+// parallelism is 1), which leaves the build on a single working thread.  Fall
+// back to the number of available cores so that the build uses the machine.
+int64_t get_default_fts_build_parallelism()
+{
+  int64_t cpu_count = get_cpu_count();
+  if (cpu_count <= 0) {
+    cpu_count = 1;
+  }
+  return MIN(cpu_count, MAX_DEFAULT_FTS_BUILD_PARALLELISM);
 }
 } // namespace
 
@@ -1040,14 +1066,20 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
   if (OB_UNLIKELY(original_parallelism <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
+    int64_t effective_parallelism = original_parallelism;
+    if (original_parallelism <= 1 && is_fts_build_aux_index(index_type)) {
+      // No degree of parallelism was requested: use the available cores instead
+      // of building the auxiliary table with a single working thread.
+      effective_parallelism = get_default_fts_build_parallelism();
+    }
     switch (index_type) {
       case share::schema::ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL:
-        decided_parallelism = MAX(original_parallelism, 1L);
+        decided_parallelism = MAX(effective_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        decided_parallelism = MAX(effective_parallelism / 3, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
