@@ -279,6 +279,9 @@ private:
 class ObAIFuncUtils 
 {
 public:
+  static int validate_embedding_result(ObIAllocator &allocator, ObIJsonBase *result, int64_t dimension = 0);
+  static int normalize_rerank_result(ObIAllocator &allocator, ObIJsonBase *result,
+                                     int64_t count, ObJsonArray *&normalized);
   ObAIFuncUtils() {}
   virtual ~ObAIFuncUtils() {}
   static bool is_completion_type(const ObAIFuncExprInfo *info) {return info->type_ == share::EndpointType::COMPLETION;}
