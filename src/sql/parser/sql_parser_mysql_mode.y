@@ -46,14 +46,19 @@
   ParseNode *display_node = NULL; \
   if (0 != explain_type) { \
     malloc_terminal_node(type_node, result->malloc_pool_, explain_type); \
+  } else if (0 != (no_use)[0]) { \
+    /* DESCRIBE is marked by a T_INT node in the format slot, the explain node \
+       value must be left as INT64_MAX for question_mark_issue(). */ \
+    malloc_terminal_node(type_node, result->malloc_pool_, T_INT); \
+    if (NULL != type_node) { \
+      type_node->value_ = 1; \
+    } \
   } \
   if (0 != display_type) { \
     malloc_terminal_node(display_node, result->malloc_pool_, display_type); \
   } \
   malloc_non_terminal_node(explain_stmt, result->malloc_pool_, T_EXPLAIN, 5, \
                            type_node, display_node, into_table, set_statement_id, stmt);
-  explain_stmt->value_ = (int64_t)(no_use[0]);
-%}
 
 // file table function: read_csv(...)/read_json(...)/read_parquet(...)/glob(...)
 // func_type: 1 = read_csv, 2 = read_json, 3 = read_parquet, 4 = glob
@@ -68,6 +73,50 @@
     malloc_non_terminal_node(file_expr, (malloc_pool), T_FILE_TABLE_EXPRESSION, 3, (args), NULL, file_alias_node); \
     file_expr->value_ = (func_type); \
   } while (0)
+
+static int file_table_name_is(const ParseNode *name, const char *literal)
+{
+  int same = 1;
+  const size_t len = strlen(literal);
+  if (OB_ISNULL(name) || OB_ISNULL(name->str_value_) || name->str_len_ != (int32_t)len) {
+    same = 0;
+  }
+  for (size_t i = 0; same && i < len; ++i) {
+    char c = name->str_value_[i];
+    if (c >= 'A' && c <= 'Z') {
+      c = (char)(c - 'A' + 'a');
+    }
+    if (c != literal[i]) {
+      same = 0;
+    }
+  }
+  return same;
+}
+
+static int file_table_func_type(const ParseNode *name, int64_t *func_type)
+{
+  int found = 1;
+  if (OB_ISNULL(func_type)) {
+    found = 0;
+  } else {
+    *func_type = 0;
+  }
+  if (file_table_name_is(name, "read_csv")) {
+    *func_type = 1;
+  } else if (file_table_name_is(name, "read_json")) {
+    *func_type = 2;
+  } else if (file_table_name_is(name, "read_parquet")) {
+    *func_type = 3;
+  } else if (file_table_name_is(name, "glob")) {
+    *func_type = 4;
+  } else if (file_table_name_is(name, "read_ndjson")) {
+    *func_type = 5;
+  } else {
+    found = 0;
+  }
+  return found;
+}
+%}
 
 %destructor {destroy_tree($$);}<node>
 %destructor {oceanbase::common::ob_free($$);}<str_value_>
@@ -352,7 +401,7 @@ END_P SET_VAR DELIMITER
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
-        READ_CSV READ_JSON READ_PARQUET
+        READ_CSV READ_JSON READ_NDJSON READ_PARQUET
 
         SAMPLE SAVEPOINT SCALARS SCHEMA_NAME SCN SCOPE SCORE SECOND SECURITY SEED
         SEMISTRUCT_ENCODING_TYPE SERIAL SERIALIZABLE SESSION SESSION_USER SET_TP SHARE SHARED SHUTDOWN SIGNED
@@ -515,6 +564,8 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_table_expr file_table_arg_list file_table_arg file_table_arg_name file_table_arg_value
+%type <node> copy_stmt copy_option_list copy_option_item copy_option_item_list
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -17526,6 +17577,18 @@ READ_CSV '(' file_table_arg_list ')'
 {
   GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, 2, $3, $6);
 }
+| READ_NDJSON '(' file_table_arg_list ')'
+{
+  GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, 5, $3, NULL);
+}
+| READ_NDJSON '(' file_table_arg_list ')' relation_name
+{
+  GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, 5, $3, $5);
+}
+| READ_NDJSON '(' file_table_arg_list ')' AS relation_name
+{
+  GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, 5, $3, $6);
+}
 | READ_PARQUET '(' file_table_arg_list ')'
 {
   GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, 3, $3, NULL);
@@ -17550,6 +17613,36 @@ READ_CSV '(' file_table_arg_list ')'
 {
   GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, 4, $3, $6);
 }
+| NAME_OB '(' file_table_arg_list ')'
+{
+  int64_t func_type = 0;
+  if (!file_table_func_type($1, &func_type)) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  } else {
+    GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, func_type, $3, NULL);
+  }
+}
+| NAME_OB '(' file_table_arg_list ')' relation_name
+{
+  int64_t func_type = 0;
+  if (!file_table_func_type($1, &func_type)) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  } else {
+    GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, func_type, $3, $5);
+  }
+}
+| NAME_OB '(' file_table_arg_list ')' AS relation_name
+{
+  int64_t func_type = 0;
+  if (!file_table_func_type($1, &func_type)) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  } else {
+    GEN_FILE_TABLE_EXPR($$, result->malloc_pool_, func_type, $3, $6);
+  }
+}
 ;
 
 file_table_arg_list:
@@ -17570,7 +17663,7 @@ file_table_arg_value
   make_name_node(arg_name_node, result->malloc_pool_, "");
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, arg_name_node, $1);
 }
-| file_table_arg_name '=' file_table_arg_value
+| file_table_arg_name COMP_EQ file_table_arg_value
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_ARG, 2, $1, $3);
 }
@@ -17594,8 +17687,25 @@ literal
 }
 | '-' INTNUM
 {
-  $2->value_ = -$2->value_;
-  $$ = $2;
+  ParseNode *value_node = $2;
+  if (NULL != value_node && NULL != value_node->str_value_ && value_node->str_len_ > 0) {
+    /* keep the sign in the text form of the literal so that it can be parsed
+       uniformly, the numeric value of the node is not the literal itself */
+    char *signed_text = (char *)parse_malloc(value_node->str_len_ + 2, result->malloc_pool_);
+    if (NULL == signed_text) {
+      yyerror(NULL, result, "No more space for the negative literal\n");
+      YYABORT_NO_MEMORY;
+    } else {
+      signed_text[0] = '-';
+      memcpy(signed_text + 1, value_node->str_value_, value_node->str_len_);
+      signed_text[value_node->str_len_ + 1] = '\0';
+      value_node->str_value_ = signed_text;
+      value_node->str_len_ += 1;
+    }
+  } else if (NULL != value_node) {
+    value_node->value_ = -value_node->value_;
+  }
+  $$ = value_node;
 }
 ;
 
@@ -17606,7 +17716,7 @@ COPY '(' select_no_parens ')' TO STRING_VALUE copy_option_list
   ParseNode *format_node = NULL;
   ParseNode *into_node = NULL;
   if (NULL == select_node) {
-    yyerror("invalid copy statement");
+    yyerror(NULL, result, "invalid copy statement");
     $$ = NULL;
   } else {
     merge_nodes(format_node, result, T_EXTERNAL_FILE_FORMAT, $7);
@@ -17643,6 +17753,17 @@ NAME_OB
 | NAME_OB STRING_VALUE
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $2);
+}
+| NAME_OB NAME_OB
+{
+  /* a bare identifier value, e.g. 'format csv' */
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $2);
+}
+| unreserved_keyword NAME_OB
+{
+  ParseNode *name_node = NULL;
+  get_non_reserved_node(name_node, result->malloc_pool_, @1.first_column, @1.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, name_node, $2);
 }
 | unreserved_keyword
 {
@@ -17890,7 +18011,6 @@ ACCOUNT
 |       GEOMETRYCOLLECTION
 |       GET_FORMAT
 |       GLOBAL %prec LOWER_PARENS
-|       GLOB
 |       GRANTS
 |       GROUPING
 |       GROUP_CONCAT
@@ -18117,9 +18237,6 @@ ACCOUNT
 |       QUICK
 |       RANK
 |       READ_ONLY
-|       READ_CSV
-|       READ_JSON
-|       READ_PARQUET
 |       RECOVER
 |       RECOVERY
 |       RECURSIVE

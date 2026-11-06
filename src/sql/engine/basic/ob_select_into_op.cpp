@@ -989,7 +989,7 @@ int ObSelectIntoOp::into_outfile(ObExternalFileWriter *data_writer)
   if (OB_ISNULL(csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer))) {
     ret = OB_ERR_UNEXPECTED;
   }
-  if (OB_SUCC(ret) && MY_SPEC.write_header_ && !header_written_ && OB_NOTNULL(csv_data_writer)) {
+  if (OB_SUCC(ret) && MY_SPEC.write_header_ && !header_written_ && OB_NOT_NULL(csv_data_writer)) {
     OZ(write_header_line(*csv_data_writer));
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {

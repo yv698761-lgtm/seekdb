@@ -3016,8 +3016,13 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
   }
   if (OB_SUCC(ret) && NULL != (format_node = node->children_[1])) { // format
     if (has_copy_option(format_node)) {
-      // the options of the COPY statement
-      if (OB_FAIL(resolve_copy_format(format_node, into_item))) {
+      // COPY is part of the file SQL feature and is gated by the same switch.
+      bool enable_file_sql = false;
+      if (OB_FAIL(session_info_->get_enable_file_sql(enable_file_sql))) {
+      } else if (!enable_file_sql) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "file SQL");
+      } else if (OB_FAIL(resolve_copy_format(format_node, into_item))) {
       }
     } else if (OB_FAIL(resolve_outfile_format(format_node, into_item))) {
     }
@@ -3080,10 +3085,10 @@ int ObSelectResolver::resolve_outfile_format(const ParseNode *format_node,
 bool ObSelectResolver::has_copy_option(const ParseNode *format_node)
 {
   bool has_copy_option = false;
-  if (OB_NOTNULL(format_node)) {
+  if (OB_NOT_NULL(format_node)) {
     for (int i = 0; i < format_node->num_child_; ++i) {
       ParseNode *option_node = format_node->children_[i];
-      if (OB_NOTNULL(option_node) && T_COPY_OPTION == option_node->type_) {
+      if (OB_NOT_NULL(option_node) && T_COPY_OPTION == option_node->type_) {
         has_copy_option = true;
         break;
       }
@@ -3111,7 +3116,7 @@ int ObSelectResolver::resolve_copy_format(const ParseNode *format_node,
     ObString option_name = option_node->children_[0]->str_value_;
     bool has_value = false;
     ObString option_value;
-    if (option_node->num_child_ > 1 && OB_NOTNULL(option_node->children_[1])) {
+    if (option_node->num_child_ > 1 && OB_NOT_NULL(option_node->children_[1])) {
       option_value = option_node->children_[1]->str_value_;
       has_value = true;
     }
@@ -3120,8 +3125,8 @@ int ObSelectResolver::resolve_copy_format(const ParseNode *format_node,
         // the value of the format option may be a bare identifier, e.g. 'format csv'
         if (i + 1 < format_node->num_child_) {
           ParseNode *value_node = format_node->children_[i + 1];
-          if (OB_NOTNULL(value_node) && T_COPY_OPTION == value_node->type_
-              && value_node->num_child_ == 1 && OB_NOTNULL(value_node->children_[0])) {
+          if (OB_NOT_NULL(value_node) && T_COPY_OPTION == value_node->type_
+              && value_node->num_child_ == 1 && OB_NOT_NULL(value_node->children_[0])) {
             ObString value_name = value_node->children_[0]->str_value_;
             if (is_same_copy_option(value_name, "csv")
                 || is_same_copy_option(value_name, "json")

@@ -64,7 +64,7 @@ bool has_wildcard(const std::string &text)
 }
 
 /// Case insensitive comparison against a lower case literal.
-bool equals_ignore_case(const std::string &text, const char *literal)
+bool path_equals_ignore_case(const std::string &text, const char *literal)
 {
   const size_t len = ::strlen(literal);
   if (text.size() != len) {
@@ -142,6 +142,17 @@ bool list_directory(const std::string &path, std::vector<std::string> &entries)
 }
 
 /// Recursively expand the directory components of a pattern.
+std::string file_source_join_path(const std::string &dir, const std::string &name)
+{
+  if (dir.empty()) {
+    return name;
+  }
+  if ('/' == dir[dir.size() - 1]) {
+    return dir + name;
+  }
+  return dir + "/" + name;
+}
+
 void expand_directory(const std::vector<std::string> &components,
                        size_t index,
                        const std::string &current,
@@ -153,7 +164,7 @@ void expand_directory(const std::vector<std::string> &components,
   }
   const std::string &component = components[index];
   if (!has_wildcard(component)) {
-    const std::string next = current + "/" + component;
+    const std::string next = file_source_join_path(current, component);
     expand_directory(components, index + 1, next, results);
     return;
   }
@@ -164,7 +175,7 @@ void expand_directory(const std::vector<std::string> &components,
   std::sort(entries.begin(), entries.end());
   for (size_t i = 0; i < entries.size(); ++i) {
     if (match_glob_pattern(component, entries[i])) {
-      const std::string next = current + "/" + entries[i];
+      const std::string next = file_source_join_path(current, entries[i]);
       expand_directory(components, index + 1, next, results);
     }
   }
@@ -272,7 +283,7 @@ bool absolute_path(const std::string &path, std::string &result)
 
 bool check_secure_path(const std::string &secure_file_priv, const std::string &path, std::string &error)
 {
-  if (secure_file_priv.empty() || equals_ignore_case(secure_file_priv, kNullFilePriv)) {
+  if (secure_file_priv.empty() || path_equals_ignore_case(secure_file_priv, kNullFilePriv)) {
     error = "Access denied, please set suitable variable 'secure_file_priv' first";
     return false;
   }
@@ -406,7 +417,7 @@ bool glob_files(const std::string &pattern, std::vector<std::string> &files)
   for (size_t i = 0; i < dirs.size(); ++i) {
     const std::string &dir = dirs[i];
     if (!has_wildcard(file_pattern)) {
-      const std::string candidate = dir + "/" + file_pattern;
+      const std::string candidate = file_source_join_path(dir, file_pattern);
       if (is_regular_file(candidate)) {
         files.push_back(candidate);
       }

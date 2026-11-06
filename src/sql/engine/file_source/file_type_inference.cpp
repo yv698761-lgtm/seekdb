@@ -33,7 +33,7 @@ bool is_space_char(char c) { return ' ' == c || '\t' == c; }
 bool is_digit_char(char c) { return c >= '0' && c <= '9'; }
 
 /// Case insensitive comparison of two ASCII strings.
-bool equals_ignore_case(const std::string &lhs, const std::string &rhs)
+bool infer_equals_ignore_case(const std::string &lhs, const std::string &rhs)
 {
   if (lhs.size() != rhs.size()) {
     return false;
@@ -239,7 +239,7 @@ ColumnType ColumnTypeAccumulator::infer_literal_type(const std::string &text)
     return ColumnType::NULL_TYPE;
   }
   // boolean literals, case insensitive
-  if (equals_ignore_case(text, "true") || equals_ignore_case(text, "false")) {
+  if (infer_equals_ignore_case(text, "true") || infer_equals_ignore_case(text, "false")) {
     return ColumnType::BOOLEAN;
   }
   // integer literal, may overflow int64 and then widen to double
@@ -288,7 +288,7 @@ ColumnType ColumnTypeAccumulator::infer_literal_type(const std::string &text)
         float_like = false;
       }
     }
-    if (float_like && has_digit && has_dot) {
+    if (float_like && has_digit && (has_dot || has_exp)) {
       double dbl = 0;
       if (parse_double(text, dbl)) {
         return ColumnType::DOUBLE;

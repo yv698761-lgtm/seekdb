@@ -165,8 +165,9 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
 
   // DESCRIBE on a file table is rewritten into a plain select statement which
   // returns the column metadata of the file table
-  if (OB_SUCC(ret) && T_EXPLAIN == parse_tree.type_ && 1 == parse_tree.value_
-      && OB_NOTNULL(params_.allocator_)) {
+  if (OB_SUCC(ret) && T_EXPLAIN == parse_tree.type_ && 5 == parse_tree.num_child_
+      && OB_NOT_NULL(parse_tree.children_[0]) && T_INT == parse_tree.children_[0]->type_
+      && 1 == parse_tree.children_[0]->value_ && OB_NOT_NULL(params_.allocator_)) {
     ParseNode *describe_stmt_tree = NULL;
     ret = ObExplainResolver::build_file_table_describe_stmt(parse_tree, *params_.allocator_,
                                                             describe_stmt_tree);

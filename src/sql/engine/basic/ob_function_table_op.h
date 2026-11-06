@@ -79,6 +79,7 @@ private:
   int inner_get_next_row_sys_func();
   int inner_get_next_row_file();
   int open_file_source();
+  int check_file_sql_session();
   int build_describe_rows();
   int produce_describe_row();
   int produce_file_row(const file_source::FileRow &row);

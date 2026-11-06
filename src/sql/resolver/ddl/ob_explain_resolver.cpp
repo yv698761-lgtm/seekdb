@@ -66,6 +66,9 @@ const char *file_table_default_alias(int64_t func_type, int32_t &alias_len)
     case 3:
       alias_len = 12;
       return "read_parquet";
+    case 5:
+      alias_len = 11;
+      return "read_ndjson";
     default:
       alias_len = 4;
       return "glob";
@@ -91,61 +94,16 @@ int ObExplainResolver::build_file_table_describe_stmt(const ParseNode &parse_tre
     // it does not describe a file table, keep the normal explain behavior
     return OB_SUCCESS;
   }
-  // the alias name of the file table, it is used as the table name of the
-  // column references of the describe result
-  const char *alias = NULL;
-  int32_t alias_len = 0;
-  ParseNode *alias_node = (file_node->num_child_ > 2) ? file_node->children_[2] : NULL;
-  if (OB_NOT_NULL(alias_node) && OB_NOT_NULL(alias_node->str_value_) && alias_node->str_len_ > 0) {
-    alias = alias_node->str_value_;
-    alias_len = static_cast<int32_t>(alias_node->str_len_);
+  // Mark the file table so that it outputs the column metadata. The select list of
+  // the statement is kept as it is: the star expansion of the statement uses the
+  // columns created by the resolver of the file table.
+  ParseNode *describe_flag = new_terminal_node(&allocator, T_INT);
+  if (OB_ISNULL(describe_flag)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    alias = file_table_default_alias(file_node->value_, alias_len);
-  }
-  // rebuild the select items of the statement
-  ParseNode *items[FILE_TABLE_DESCRIBE_COLUMN_COUNT];
-  for (int64_t i = 0; i < FILE_TABLE_DESCRIBE_COLUMN_COUNT; ++i) {
-    items[i] = NULL;
-  }
-  for (int64_t i = 0; OB_SUCC(ret) && i < FILE_TABLE_DESCRIBE_COLUMN_COUNT; ++i) {
-    ParseNode *table_node = new_terminal_node(&allocator, T_IDENT);
-    ParseNode *column_node = new_terminal_node(&allocator, T_IDENT);
-    if (OB_ISNULL(table_node) || OB_ISNULL(column_node)) {
-      ret = OB_ERR_UNEXPECTED;
-      break;
-    }
-    table_node->str_value_ = parse_strdup(alias, &allocator, &table_node->str_len_);
-    column_node->str_value_ = parse_strdup(FILE_TABLE_DESCRIBE_COLUMNS[i], &allocator,
-                                           &column_node->str_len_);
-    if (OB_ISNULL(table_node->str_value_) || OB_ISNULL(column_node->str_value_)) {
-      ret = OB_ERR_UNEXPECTED;
-      break;
-    }
-    items[i] = new_non_terminal_node(&allocator, T_COLUMN_REF, 3, table_node, (ParseNode *)NULL, column_node);
-    if (OB_ISNULL(items[i])) {
-      ret = OB_ERR_UNEXPECTED;
-      break;
-    }
-  }
-  if (OB_SUCC(ret)) {
-    ParseNode *project_list = new_non_terminal_node(&allocator, T_PROJECT_LIST,
-                                                    FILE_TABLE_DESCRIBE_COLUMN_COUNT,
-                                                    items[0], items[1], items[2],
-                                                    items[3], items[4], items[5]);
-    if (OB_ISNULL(project_list)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      select_node->children_[PARSE_SELECT_SELECT] = project_list;
-      // mark the file table, so that it outputs the column metadata
-      ParseNode *describe_flag = new_terminal_node(&allocator, T_INT);
-      if (OB_ISNULL(describe_flag)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
-        describe_flag->value_ = 1;
-        file_node->children_[1] = describe_flag;
-        describe_stmt_tree = select_node;
-      }
-    }
+    describe_flag->value_ = 1;
+    file_node->children_[1] = describe_flag;
+    describe_stmt_tree = select_node;
   }
   return ret;
 }
@@ -191,6 +149,9 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
         ParseNode *format = parse_tree.children_[EXPLAIN_FORMAT];
         if (NULL != format) {
           switch (format->type_) {
+          case T_INT: {
+            // the describe marker of a file table, no explain format is specified
+          } break;
           case T_OUTLINE:
           {
             explain_stmt->set_explain_format(EXPLAIN_OUTLINE);

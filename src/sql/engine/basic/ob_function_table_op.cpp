@@ -20,6 +20,8 @@
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "sql/engine/file_source/file_source_reader.h"
+#include "sql/engine/file_source/file_source_util.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "common/timezone/ob_time_convert.h"
 
 #include <cctype>
@@ -41,7 +43,7 @@ namespace sql
 class ObFileSourceCtx
 {
 public:
-  ObFileSourceCtx() : reader(NULL), describe_index_(0), describe_rows_() {}
+  ObFileSourceCtx() : reader(NULL), describe_index_(0), describe_rows_(), rows_read_(0) {}
   ~ObFileSourceCtx() { reset(); }
   void reset()
   {
@@ -51,11 +53,13 @@ public:
     }
     describe_rows_.clear();
     describe_index_ = 0;
+    rows_read_ = 0;
   }
 public:
   file_source::FileSourceReader *reader;
   int64_t describe_index_;
   std::vector<std::vector<std::string> > describe_rows_;
+  int64_t rows_read_;
 };
 
 static int file_source_error_to_errno(const file_source::FileSourceError &error)
@@ -71,6 +75,9 @@ static int file_source_error_to_errno(const file_source::FileSourceError &error)
     case file_source::FileErrorCode::UNSUPPORTED_FORMAT:
     case file_source::FileErrorCode::NOT_SUPPORTED:
       ret = OB_NOT_SUPPORTED;
+      break;
+    case file_source::FileErrorCode::FILE_CHANGED:
+      ret = OB_ERR_UNEXPECTED;
       break;
     default:
       ret = OB_ERR_UNEXPECTED;
@@ -338,10 +345,39 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
 }
 
 
+int ObFunctionTableOp::check_file_sql_session()
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  bool enable_file_sql = false;
+  ObString secure_file_priv;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_enable_file_sql(enable_file_sql))) {
+  } else if (!enable_file_sql) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function");
+  } else if (OB_FAIL(session->get_secure_file_priv(secure_file_priv))) {
+  } else {
+    std::string priv;
+    if (!secure_file_priv.empty()) {
+      priv.assign(secure_file_priv.ptr(), secure_file_priv.length());
+    }
+    std::string path(MY_SPEC.file_path_.ptr(), MY_SPEC.file_path_.length());
+    std::string error;
+    if (!file_source::check_secure_path(priv, path, error)) {
+      ret = OB_ERR_NO_PRIVILEGE;
+      LOG_USER_ERROR(OB_ERR_NO_PRIVILEGE, "%s", error.c_str());
+    }
+  }
+  return ret;
+}
+
 int ObFunctionTableOp::open_file_source()
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(file_ctx_)) {
+  if (OB_FAIL(check_file_sql_session())) {
+  } else if (OB_ISNULL(file_ctx_)) {
     file_ctx_ = new (std::nothrow) ObFileSourceCtx();
     if (OB_ISNULL(file_ctx_)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -375,9 +411,18 @@ int ObFunctionTableOp::open_file_source()
     }
     if (!error.is_ok()) {
       ret = file_source_error_to_errno(error);
-      LOG_USER_ERROR(ret, "%s", error.to_string().c_str());
+      LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", error.to_string().c_str());
     } else if (MY_SPEC.file_describe_) {
       ret = build_describe_rows();
+    } else if (file_source::FileFormat::GLOB != options.format) {
+      // Infer the schema of the file so that the columns of the rows are laid out
+      // in the same order as the columns resolved by the resolver.
+      file_source::FileSchema schema;
+      file_source::FileSourceError schema_error = file_ctx_->reader->infer_schema(schema);
+      if (!schema_error.is_ok()) {
+        ret = file_source_error_to_errno(schema_error);
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", schema_error.to_string().c_str());
+      }
     }
   }
   return ret;
@@ -392,7 +437,7 @@ int ObFunctionTableOp::build_describe_rows()
   file_source::FileSourceError error = file_ctx_->reader->infer_schema(schema);
   if (!error.is_ok()) {
     ret = file_source_error_to_errno(error);
-    LOG_USER_ERROR(ret, "%s", error.to_string().c_str());
+    LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", error.to_string().c_str());
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < schema.column_count(); ++i) {
       const file_source::FileColumn *column = schema.column_at(i);
@@ -448,18 +493,29 @@ int ObFunctionTableOp::inner_get_next_row_file()
   } else if (MY_SPEC.file_describe_) {
     ret = produce_describe_row();
   } else {
-    file_source::FileRow row;
     file_source::FileSourceError error;
-    const bool has_row = file_ctx_->reader->next_row(row, error);
-    if (!has_row) {
-      if (error.is_ok()) {
-        ret = OB_ITER_END;
-      } else {
+    if (0 == (file_ctx_->rows_read_ & 1023)
+        && file_source::FileFormat::GLOB != static_cast<file_source::FileFormat>(MY_SPEC.file_format_)) {
+      error = file_ctx_->reader->check_unchanged();
+      if (!error.is_ok()) {
         ret = file_source_error_to_errno(error);
-        LOG_USER_ERROR(ret, "%s", error.to_string().c_str());
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", error.to_string().c_str());
       }
-    } else {
-      ret = produce_file_row(row);
+    }
+    if (OB_SUCC(ret)) {
+      ++file_ctx_->rows_read_;
+      file_source::FileRow row;
+      const bool has_row = file_ctx_->reader->next_row(row, error);
+      if (!has_row) {
+        if (error.is_ok()) {
+          ret = OB_ITER_END;
+        } else {
+          ret = file_source_error_to_errno(error);
+          LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", error.to_string().c_str());
+        }
+      } else {
+        ret = produce_file_row(row);
+      }
     }
   }
   return ret;
@@ -493,8 +549,7 @@ int ObFunctionTableOp::set_file_datum(ObExpr *expr, ObDatum &datum, const char *
     case ObTinyIntType:
     case ObSmallIntType:
     case ObIntType:
-    case ObMediumIntType:
-    case ObBigIntType: {
+    case ObMediumIntType: {
       int64_t int_value = 0;
       if (OB_FAIL(file_source_parse_int(value, len, int_value))) {
       } else {
@@ -517,7 +572,7 @@ int ObFunctionTableOp::set_file_datum(ObExpr *expr, ObDatum &datum, const char *
       if (OB_FAIL(ObTimeConverter::str_to_date(date_string, date_value))) {
         std::string text(value, len);
         ret = OB_ERR_UNEXPECTED;
-        LOG_USER_ERROR(ret, "invalid date value '%s' in file", text.c_str());
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "invalid date value '%s' in file", text.c_str());
       } else {
         datum.set_date(date_value);
       }
@@ -538,7 +593,7 @@ int ObFunctionTableOp::set_file_datum(ObExpr *expr, ObDatum &datum, const char *
       ObString datetime_string(static_cast<int64_t>(normalized.length()), normalized.c_str());
       if (OB_FAIL(ObTimeConverter::str_to_datetime(datetime_string, cvrt_ctx, datetime_value))) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_USER_ERROR(ret, "invalid datetime value '%s' in file", normalized.c_str());
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "invalid datetime value '%s' in file", normalized.c_str());
       } else {
         datum.set_datetime(datetime_value);
       }

@@ -128,10 +128,10 @@ struct ObSelectIntoItem
         max_file_size_(DEFAULT_MAX_FILE_SIZE),
         escaped_cht_(),
         buffer_size_(DEFAULT_BUFFER_SIZE),
+        external_properties_(),
         write_header_(false),
         null_str_(),
-        column_names_(),
-        external_properties_()
+        column_names_()
   {
     field_str_.set_varchar(DEFAULT_FIELD_TERM_STR);
     field_str_.set_collation_type(ObCharset::get_system_collation());

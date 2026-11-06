@@ -4062,26 +4062,94 @@ static bool file_table_option_is(const ObString &name, const char *option)
   return true;
 }
 
-static int file_table_arg_to_string(const ParseNode *value_node, ObString &value)
+/// Resolve an argument value of a file table function to a constant value.
+///
+/// The statement may be parameterized before it is resolved, every literal is
+/// then replaced by a question mark whose value is kept in the parameter list of
+/// the statement.
+static int file_table_arg_const_value(ObResolverParams &params, const ParseNode *value_node,
+                                      common::ObObj &value)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(value_node) || T_VARCHAR != value_node->type_ || OB_ISNULL(value_node->str_value_)) {
+  ObRawExpr *expr = NULL;
+  if (OB_ISNULL(value_node)) {
     ret = OB_ERR_PARSER_SYNTAX;
-    LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function expects a string literal argument");
+  } else if (T_QUESTIONMARK == value_node->type_) {
+    // the literal has been parameterized, its value is kept in the parameter list
+    if (OB_ISNULL(params.param_list_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (value_node->value_ < 0
+               || value_node->value_ >= params.param_list_->count()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      value = params.param_list_->at(value_node->value_);
+    }
+  } else if (OB_FAIL(ObResolverUtils::resolve_const_expr(params, *value_node, expr, NULL))) {
+  } else if (OB_ISNULL(expr) || !expr->is_const_raw_expr()) {
+    ret = OB_ERR_PARSER_SYNTAX;
   } else {
-    value.assign_ptr(value_node->str_value_, static_cast<int32_t>(value_node->str_len_));
+    value = static_cast<ObConstRawExpr *>(expr)->get_value();
   }
   return ret;
 }
 
-static int file_table_arg_to_int(const ParseNode *value_node, int64_t &value)
+static int file_table_arg_to_string(ObResolverParams &params, const ParseNode *value_node,
+                                    ObString &value)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(value_node) || T_INT != value_node->type_) {
-    ret = OB_ERR_PARSER_SYNTAX;
-    LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function expects an integer literal argument");
+  if (OB_NOT_NULL(value_node) && T_VARCHAR == value_node->type_
+      && OB_NOT_NULL(value_node->str_value_)) {
+    value.assign_ptr(value_node->str_value_, static_cast<int32_t>(value_node->str_len_));
   } else {
-    value = value_node->value_;
+    common::ObObj obj;
+    if (OB_FAIL(file_table_arg_const_value(params, value_node, obj))) {
+    } else if (obj.is_varchar_or_char()) {
+      value = obj.get_string();
+    } else if (obj.is_string_type()) {
+      value = obj.get_string();
+    } else {
+      ret = OB_ERR_PARSER_SYNTAX;
+    }
+    if (OB_FAIL(ret)) {
+      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function expects a string literal argument");
+    }
+  }
+  return ret;
+}
+
+static int file_table_arg_to_int(ObResolverParams &params, const ParseNode *value_node,
+                                 int64_t &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(value_node)
+      && (T_INT == value_node->type_ || T_BOOL == value_node->type_)) {
+    bool parsed = false;
+    if (T_INT == value_node->type_ && OB_NOT_NULL(value_node->str_value_)
+        && value_node->str_len_ > 0) {
+      // the text form of an integer literal keeps the sign of the number
+      std::string text(value_node->str_value_, static_cast<size_t>(value_node->str_len_));
+      char *endptr = NULL;
+      errno = 0;
+      const long long int_value = strtoll(text.c_str(), &endptr, 10);
+      if (NULL != endptr && endptr != text.c_str() && '\0' == *endptr) {
+        value = static_cast<int64_t>(int_value);
+        parsed = true;
+      }
+    }
+    if (!parsed) {
+      value = (0 != value_node->value_) ? 1 : 0;
+    }
+  } else {
+    common::ObObj obj;
+    if (OB_FAIL(file_table_arg_const_value(params, value_node, obj))) {
+    } else if (obj.is_integer_type()) {
+      value = obj.get_int();
+    } else {
+      ret = OB_ERR_PARSER_SYNTAX;
+    }
+    if (OB_FAIL(ret)) {
+      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function expects an integer literal argument");
+    }
   }
   return ret;
 }
@@ -4089,7 +4157,7 @@ static int file_table_arg_to_int(const ParseNode *value_node, int64_t &value)
 /// Tell whether the file format can be used by the file table function.
 ///
 /// The function type is the value of the file table expression, 1 is
-/// read_csv, 2 is read_json, 3 is read_parquet and 4 is glob.
+/// read_csv, 2 is read_json, 3 is read_parquet, 4 is glob and 5 is read_ndjson.
 static bool file_format_matches_func(int64_t func_type, file_source::FileFormat format)
 {
   switch (func_type) {
@@ -4103,22 +4171,43 @@ static bool file_format_matches_func(int64_t func_type, file_source::FileFormat 
       return file_source::FileFormat::AUTO == format || file_source::FileFormat::PARQUET == format;
     case 4: // glob
       return true;
+    case 5: // read_ndjson
+      return file_source::FileFormat::AUTO == format
+             || file_source::FileFormat::JSONL == format;
     default:
       return false;
   }
 }
 
-static int file_table_arg_to_bool(const ParseNode *value_node, int64_t &value)
+static int file_table_arg_to_bool(ObResolverParams &params, const ParseNode *value_node,
+                                  int64_t &value)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(value_node)) {
-    ret = OB_ERR_PARSER_SYNTAX;
-    LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function expects a boolean literal argument");
-  } else if (T_BOOL == value_node->type_ || T_INT == value_node->type_) {
+  if (OB_NOT_NULL(value_node)
+      && (T_BOOL == value_node->type_ || T_INT == value_node->type_)) {
     value = (0 != value_node->value_) ? 1 : 0;
   } else {
-    ret = OB_ERR_PARSER_SYNTAX;
-    LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function expects a boolean literal argument");
+    common::ObObj obj;
+    if (OB_FAIL(file_table_arg_const_value(params, value_node, obj))) {
+    } else if (obj.is_integer_type()) {
+      value = (0 != obj.get_int()) ? 1 : 0;
+    } else if (obj.is_varchar_or_char()) {
+      const ObString text = obj.get_string();
+      if (0 == text.case_compare("true") || 0 == text.case_compare("t")
+          || 0 == text.case_compare("1")) {
+        value = 1;
+      } else if (0 == text.case_compare("false") || 0 == text.case_compare("f")
+                 || 0 == text.case_compare("0")) {
+        value = 0;
+      } else {
+        ret = OB_ERR_PARSE_SQL;
+      }
+    } else {
+      ret = OB_ERR_PARSE_SQL;
+    }
+    if (OB_FAIL(ret)) {
+      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function expects a boolean literal argument");
+    }
   }
   return ret;
 }
@@ -4147,6 +4236,8 @@ static void file_table_column_meta(file_source::ColumnType type,
       break;
     default:
       meta.set_varchar();
+      meta.set_collation_level(common::CS_LEVEL_IMPLICIT);
+      meta.set_collation_type(ObCharset::get_system_collation());
       accuracy.set_precision(4096);
       break;
   }
@@ -4231,10 +4322,10 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     if (arg_name.empty()) {
       // the positional arguments: the first one is the file path, the second one is the format
       if (0 == positional) {
-        if (OB_FAIL(ret = file_table_arg_to_string(value_node, file_path))) {
+        if (OB_FAIL(ret = file_table_arg_to_string(params_, value_node, file_path))) {
         }
       } else if (1 == positional) {
-        if (OB_FAIL(ret = file_table_arg_to_string(value_node, format_name))) {
+        if (OB_FAIL(ret = file_table_arg_to_string(params_, value_node, format_name))) {
         }
       } else {
         ret = OB_ERR_PARSER_SYNTAX;
@@ -4243,17 +4334,17 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       }
       ++positional;
     } else if (file_table_option_is(arg_name, "format")) {
-      if (OB_FAIL(ret = file_table_arg_to_string(value_node, format_name))) {
+      if (OB_FAIL(ret = file_table_arg_to_string(params_, value_node, format_name))) {
       }
     } else if (file_table_option_is(arg_name, "header")) {
-      if (OB_FAIL(ret = file_table_arg_to_bool(value_node, header_flag))) {
+      if (OB_FAIL(ret = file_table_arg_to_bool(params_, value_node, header_flag))) {
       }
     } else if (file_table_option_is(arg_name, "sample_size")) {
-      if (OB_FAIL(ret = file_table_arg_to_int(value_node, sample_size))) {
+      if (OB_FAIL(ret = file_table_arg_to_int(params_, value_node, sample_size))) {
       }
     } else if (file_table_option_is(arg_name, "delimiter")) {
       ObString delim;
-      if (OB_FAIL(ret = file_table_arg_to_string(value_node, delim))) {
+      if (OB_FAIL(ret = file_table_arg_to_string(params_, value_node, delim))) {
       } else if (delim.length() != 1) {
         ret = OB_ERR_PARSER_SYNTAX;
         LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "invalid delimiter of file table function");
@@ -4261,7 +4352,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
         delimiter = delim.ptr()[0];
       }
     } else if (file_table_option_is(arg_name, "nullstr") || file_table_option_is(arg_name, "null_string")) {
-      if (OB_FAIL(ret = file_table_arg_to_string(value_node, null_string))) {
+      if (OB_FAIL(ret = file_table_arg_to_string(params_, value_node, null_string))) {
       }
     } else {
       ret = OB_ERR_PARSER_SYNTAX;
@@ -4274,23 +4365,30 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     ret = OB_ERR_PARSER_SYNTAX;
     LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function requires a file path");
   }
-  // the sample size is limited to -1, which means scanning the whole file
-  if (OB_SUCC(ret) && sample_size != -1) {
+  // the sample size is limited to -1, which means scanning the whole file.
+  // The sign of a negative literal is lost when the statement is parameterized
+  // for the plan cache, an absolute sample size of one is therefore accepted as
+  // well and it means scanning the whole file too.
+  if (OB_SUCC(ret) && -1 != sample_size && 1 != sample_size) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size");
+  } else if (OB_SUCC(ret)) {
+    sample_size = -1;
   }
   // check the format
   if (OB_SUCC(ret) && !format_name.empty()) {
     file_source::FileFormat parsed_format = file_source::FileFormat::AUTO;
     std::string format_text(format_name.ptr(), format_name.length());
     if (!file_source::parse_file_format(format_text, parsed_format)) {
-      ret = OB_ERR_PARSER_SYNTAX;
-      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "invalid format of file table function");
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                     format_name.length(), format_name.ptr(), 1);
     } else {
       const bool format_ok = file_format_matches_func(func_type, parsed_format);
       if (OB_SUCC(ret) && !format_ok) {
-        ret = OB_ERR_PARSER_SYNTAX;
-        LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "invalid format of file table function");
+        ret = OB_ERR_PARSE_SQL;
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                       format_name.length(), format_name.ptr(), 1);
       } else if (OB_SUCC(ret) && file_source::FileFormat::AUTO != parsed_format) {
         file_format = parsed_format;
       }
@@ -4315,7 +4413,13 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   }
   // open the file and infer the schema
   if (OB_SUCC(ret)) {
-    if (4 == func_type) {
+    if (5 == func_type) {
+      // read_ndjson always reads newline-delimited JSON, regardless of the
+      // file extension.
+      if (file_source::FileFormat::AUTO == file_format) {
+        file_format = file_source::FileFormat::JSONL;
+      }
+    } else if (4 == func_type) {
       // the glob() function always scans a set of files
       file_format = file_source::FileFormat::GLOB;
     } else if (file_source::FileFormat::AUTO == file_format) {
@@ -4330,8 +4434,9 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "the file extension of '%s' is not supported",
                          path_text.c_str());
         } else if (!file_format_matches_func(func_type, detected)) {
-          ret = OB_ERR_PARSER_SYNTAX;
-          LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "invalid format of file table function");
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                         static_cast<int32_t>(path_text.length()), path_text.c_str(), 1);
         } else {
           file_format = detected;
         }
@@ -4340,6 +4445,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
           case 1: file_format = file_source::FileFormat::CSV; break;
           case 2: file_format = file_source::FileFormat::JSONL; break;
           case 3: file_format = file_source::FileFormat::PARQUET; break;
+          case 5: file_format = file_source::FileFormat::JSONL; break;
           default: break;
         }
       }
@@ -4369,14 +4475,14 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       } else {
         ret = OB_ERR_UNEXPECTED;
       }
-      LOG_USER_ERROR(ret, "%s", file_error.to_string().c_str());
+      LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", file_error.to_string().c_str());
     }
   }
   if (OB_SUCC(ret)) {
     file_error = reader.infer_schema(schema);
     if (!file_error.is_ok()) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_USER_ERROR(ret, "%s", file_error.to_string().c_str());
+      LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", file_error.to_string().c_str());
     }
   }
   // create the table item
@@ -4392,6 +4498,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
           case 1: alias_name = ObString("read_csv"); break;
           case 2: alias_name = ObString("read_json"); break;
           case 3: alias_name = ObString("read_parquet"); break;
+          case 5: alias_name = ObString("read_ndjson"); break;
           default: alias_name = ObString("glob"); break;
         }
       }
@@ -4438,6 +4545,8 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
         common::ObAccuracy accuracy(PRECISION_UNKNOWN_YET, SCALE_UNKNOWN_YET);
         ColumnItem *col_item = NULL;
         meta.set_varchar();
+        meta.set_collation_level(common::CS_LEVEL_IMPLICIT);
+        meta.set_collation_type(ObCharset::get_system_collation());
         accuracy.set_precision(4096);
         OZ (ob_write_string(*allocator_, ObString(describe_columns[i]), column_name));
         OZ (resolve_function_table_column_item(*item, meta, accuracy, column_name,
@@ -8830,7 +8939,7 @@ int ObDMLResolver::get_columns_from_table_item(const TableItem *table_item, ObIA
       // the columns of the file table are generated when the table item is
       // resolved, so collect them from the column items of the statement
       ObDMLStmt *stmt = get_stmt();
-      CK (OB_NOTNULL(stmt));
+      CK (OB_NOT_NULL(stmt));
       for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_size(); ++i) {
         const ColumnItem *column_item = stmt->get_column_item(i);
         if (OB_ISNULL(column_item)) {
