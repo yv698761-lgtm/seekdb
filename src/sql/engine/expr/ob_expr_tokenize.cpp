@@ -393,8 +393,13 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
 {
   int ret = OB_SUCCESS;
   bool need_to_load_dic = false;
+  // the dictionary is loaded into the global dictionary cache once per thread,
+  // there is no need to check it on every call of the hot path.
+  static thread_local bool ik_dic_loaded = false;
   storage::ObDicLoaderHandle dic_loader_handle;
-  if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
+  if (ik_dic_loaded) {
+    // the dictionary has been loaded by this thread already
+  } else if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
           parser_name_, need_to_load_dic))) {
   } else if (need_to_load_dic) {
     if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
@@ -404,7 +409,11 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
     } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+    } else {
+      ik_dic_loaded = true;
     }
+  } else {
+    ik_dic_loaded = true;
   }
   return ret;
 }

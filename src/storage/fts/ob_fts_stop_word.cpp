@@ -27,6 +27,19 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+// The longest stop word of the built-in list.
+static const int32_t MAX_STOP_WORD_LENGTH = 5;
+
+bool is_possible_stop_word_start(const char c)
+{
+  // every built-in stop word starts with one of these lowercase ascii letters
+  static const char STOP_WORD_START[] = "abcdefghijklmnopqrstuvwxyz";
+  return NULL != ::strchr(STOP_WORD_START, c);
+}
+} // namespace
+
 ////////////////////////////////////////////////////////////////////////////////
 // class ObStopWordChecker
 ObStopWordChecker::~ObStopWordChecker()
@@ -81,6 +94,11 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (word.get_word().get_string().length() > MAX_STOP_WORD_LENGTH
+             || !is_possible_stop_word_start(word.get_word().get_string().ptr()[0])) {
+    // all the stop words are short and start with a lowercase ascii letter,
+    // reject the other words without hashing them
+    is_stopword = false;
   } else {
     common::ObString cmp_str;
     // do nothing set out with in if type is the same.
@@ -164,15 +182,85 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    const ObString src_str = src.get_word().get_string();
+    const char *src_ptr = src_str.ptr();
+    const int32_t src_len = src_str.length();
+    // Fast path 1: ascii words are lowered by turning 'A'-'Z' into 'a'-'z', no
+    // charset handling and no memory is needed when the word is already lower.
+    bool all_ascii = true;
+    for (int32_t i = 0; all_ascii && i < src_len; ++i) {
+      all_ascii = (static_cast<unsigned char>(src_ptr[i]) < 0x80);
+    }
+    if (all_ascii) {
+      char stack_buf[CASEDOWN_STACK_BUFFER_SIZE];
+      bool changed = false;
+      if (src_len <= static_cast<int32_t>(sizeof(stack_buf))) {
+        for (int32_t i = 0; i < src_len; ++i) {
+          const char c = src_ptr[i];
+          if (c >= 'A' && c <= 'Z') {
+            stack_buf[i] = static_cast<char>(c - 'A' + 'a');
+            changed = true;
+          } else {
+            stack_buf[i] = c;
+          }
+        }
+        if (!changed) {
+          dst = src;
+        } else {
+          char *buf = static_cast<char *>(allocator_.alloc(static_cast<int64_t>(src_len)));
+          if (OB_ISNULL(buf)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(buf, stack_buf, src_len);
+            ObFTWord tmp(src_len, buf, word_meta_);
+            dst = tmp;
+          }
+        }
+      } else {
+        ObString dst_str;
+        if (OB_FAIL(ObCharset::tolower(word_meta_.get_collation_type(), src_str, dst_str,
+                                        allocator_))) {
+        } else {
+          ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+          dst = tmp;
+        }
+      }
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      // Fast path 2: most words of a chinese text do not change when they are
+      // lowered, lower them into a stack buffer first to detect that case and
+      // keep the original buffer when nothing changes.
+      char stack_buf[CASEDOWN_STACK_BUFFER_SIZE];
+      if (src_len <= static_cast<int32_t>(sizeof(stack_buf))) {
+        MEMCPY(stack_buf, src_ptr, src_len);
+        const size_t lowered_len = ObCharset::casedn(word_meta_.get_collation_type(),
+                                                     stack_buf,
+                                                     src_len,
+                                                     stack_buf,
+                                                     sizeof(stack_buf));
+        if (OB_UNLIKELY(lowered_len <= 0 || lowered_len > sizeof(stack_buf))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (lowered_len == static_cast<size_t>(src_len)
+                   && 0 == MEMCMP(stack_buf, src_ptr, lowered_len)) {
+          dst = src;
+        } else {
+          char *buf = static_cast<char *>(allocator_.alloc(static_cast<int64_t>(lowered_len)));
+          if (OB_ISNULL(buf)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(buf, stack_buf, lowered_len);
+            ObFTWord tmp(static_cast<int32_t>(lowered_len), buf, word_meta_);
+            dst = tmp;
+          }
+        }
+      } else {
+        ObString dst_str;
+        if (OB_FAIL(ObCharset::tolower(word_meta_.get_collation_type(), src_str, dst_str,
+                                        allocator_))) {
+        } else {
+          ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+          dst = tmp;
+        }
+      }
     }
   } else {
     dst = src;
