@@ -454,7 +454,8 @@ int ObOllamaUtils::ObOllamaComplete::get_body(ObIAllocator &allocator,
     }
   }
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(object->add("options", options))) {
+    // Native Ollama only needs "options" when the caller supplied tunables.
+    if (options->element_count() > 0 && OB_FAIL(object->add("options", options))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_boolean(allocator, false, stream))) {
     } else if (OB_FAIL(object->add("stream", stream))) {
     } else {
