@@ -87,6 +87,8 @@ struct ParquetSchemaNode
   int32_t converted_type = -1;
   /// Field id of the logical type union, `-1` when the node has no logical type.
   int32_t logical_type_kind = -1;
+  /// Timestamp TimeUnit union member: 1=millis, 2=micros, 3=nanos.
+  int32_t timestamp_unit = -1;
 };
 
 /// Description of a leaf column of the file.
@@ -168,7 +170,8 @@ private:
 };
 
 /// Decompress a raw snappy block.
-bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<unsigned char> &dst);
+bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<unsigned char> &dst,
+                       size_t max_output_size = 64 * 1024 * 1024);
 
 /// Decode the RLE / bit-packing hybrid encoding.
 ///

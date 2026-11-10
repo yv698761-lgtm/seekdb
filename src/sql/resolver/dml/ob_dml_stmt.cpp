@@ -184,10 +184,13 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   // file table function
   file_path_ = other.file_path_;
   file_null_string_ = other.file_null_string_;
+  file_schema_fingerprint_ = other.file_schema_fingerprint_;
   file_format_ = other.file_format_;
   file_has_header_ = other.file_has_header_;
   file_sample_size_ = other.file_sample_size_;
   file_delimiter_ = other.file_delimiter_;
+  file_quote_ = other.file_quote_;
+  file_escape_ = other.file_escape_;
   file_describe_ = other.file_describe_;
   // ddl related
   ddl_schema_version_ = other.ddl_schema_version_;

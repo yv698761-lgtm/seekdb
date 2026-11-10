@@ -45,6 +45,7 @@ public:
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
         write_header_(false),
+        is_copy_(false),
         null_str_(),
         column_names_(),
         external_properties_()
@@ -111,6 +112,8 @@ public:
   {
     external_properties_.assign_ptr(external_properties.ptr(), external_properties.length());
   }
+  inline void set_is_copy(bool is_copy) { is_copy_ = is_copy; }
+  inline bool get_is_copy() const { return is_copy_; }
   inline void set_write_header(bool write_header)
   {
     write_header_ = write_header;
@@ -219,6 +222,7 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   bool write_header_;
+  bool is_copy_; // COPY-specific CSV and failure atomicity; not SELECT INTO.
   common::ObString null_str_;
   common::ObSEArray<common::ObString, 16, common::ModulePageAllocator, true> column_names_;
   common::ObString external_properties_;

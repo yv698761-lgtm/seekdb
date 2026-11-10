@@ -76,6 +76,7 @@ private:
   FileSchema schema_;
   std::vector<std::string> header_;
   bool opened_ = false;
+  int64_t rows_read_ = 0;
   /// Tokenizer of the streaming read path, owned by the reader.
   Tokenizer *tokenizer_ = nullptr;
   /// First record of a file without a header line, it is returned by the

@@ -4131,13 +4131,14 @@ static int file_table_arg_to_int(ObResolverParams &params, const ParseNode *valu
       char *endptr = NULL;
       errno = 0;
       const long long int_value = strtoll(text.c_str(), &endptr, 10);
-      if (NULL != endptr && endptr != text.c_str() && '\0' == *endptr) {
+      if (ERANGE != errno && NULL != endptr && endptr != text.c_str()
+          && endptr == text.c_str() + text.size()) {
         value = static_cast<int64_t>(int_value);
         parsed = true;
       }
     }
     if (!parsed) {
-      value = (0 != value_node->value_) ? 1 : 0;
+      value = value_node->value_;
     }
   } else {
     common::ObObj obj;
@@ -4279,6 +4280,8 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   int64_t positional = 0;
   int64_t func_type = 0;
   char delimiter = ',';
+  char quote = '"';
+  char escape = '\\';
   bool describe = false;
   bool enable_file_sql = false;
   file_source::FileFormat file_format = file_source::FileFormat::AUTO;
@@ -4351,6 +4354,17 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       } else {
         delimiter = delim.ptr()[0];
       }
+    } else if (file_table_option_is(arg_name, "quote") || file_table_option_is(arg_name, "escape")) {
+      ObString character;
+      if (OB_FAIL(file_table_arg_to_string(params_, value_node, character))) {
+      } else if (character.length() > 1) {
+        ret = OB_ERR_PARSER_SYNTAX;
+        LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "quote and escape require at most one byte");
+      } else if (file_table_option_is(arg_name, "quote")) {
+        quote = character.empty() ? '\0' : character.ptr()[0];
+      } else {
+        escape = character.empty() ? '\0' : character.ptr()[0];
+      }
     } else if (file_table_option_is(arg_name, "nullstr") || file_table_option_is(arg_name, "null_string")) {
       if (OB_FAIL(ret = file_table_arg_to_string(params_, value_node, null_string))) {
       }
@@ -4366,10 +4380,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "file table function requires a file path");
   }
   // the sample size is limited to -1, which means scanning the whole file.
-  // The sign of a negative literal is lost when the statement is parameterized
-  // for the plan cache, an absolute sample size of one is therefore accepted as
-  // well and it means scanning the whole file too.
-  if (OB_SUCC(ret) && -1 != sample_size && 1 != sample_size) {
+  if (OB_SUCC(ret) && -1 != sample_size) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size");
   } else if (OB_SUCC(ret)) {
@@ -4403,6 +4414,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       if (!secure_file_priv.empty()) {
         priv_text.assign(secure_file_priv.ptr(), secure_file_priv.length());
       }
+      options.secure_file_priv = priv_text;
       std::string path(file_path.ptr(), file_path.length());
       std::string error_msg;
       if (!file_source::check_secure_path(priv_text, path, error_msg)) {
@@ -4454,12 +4466,14 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     options.has_header = (header_flag < 0) ? true : (0 != header_flag);
     options.sample_size = sample_size;
     options.delimiter = delimiter;
+    options.quote = quote;
+    options.escape = escape;
     if (!null_string.empty()) {
       options.null_string = std::string(null_string.ptr(), null_string.length());
     }
     bool open_ok = true;
     if (4 == func_type) {
-      file_error = reader.open_glob(std::string(file_path.ptr(), file_path.length()));
+      file_error = reader.open_glob(std::string(file_path.ptr(), file_path.length()), options.secure_file_priv);
       open_ok = file_error.is_ok();
     } else {
       file_error = reader.open(std::string(file_path.ptr(), file_path.length()), options);
@@ -4511,8 +4525,16 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       OX (item->file_has_header_ = header_flag < 0 ? -1 : (0 != header_flag ? 1 : 0));
       OX (item->file_sample_size_ = sample_size);
       OX (item->file_delimiter_ = delimiter);
+      OX (item->file_quote_ = quote);
+      OX (item->file_escape_ = escape);
       OX (item->file_null_string_ = null_string);
       OX (item->file_describe_ = describe);
+      if (OB_SUCC(ret) && !describe && file_source::FileFormat::GLOB != file_format) {
+        const std::string fingerprint = schema.fingerprint();
+        OZ (ob_write_string(*allocator_,
+                            ObString(static_cast<int32_t>(fingerprint.size()), fingerprint.data()),
+                            item->file_schema_fingerprint_));
+      }
     }
   }
   // the optimizer requires a non-null value expression of the function table

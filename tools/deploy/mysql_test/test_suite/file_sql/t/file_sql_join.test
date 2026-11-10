@@ -1,0 +1,35 @@
+# owner: database-competition
+# owner group: SQL
+# Native file-table JOIN, aggregation, rescan, aliases and projection regressions.
+--source mysql_test/test_suite/file_sql/include/copy_file_sql_data.inc
+--disable_query_log
+let $FILE_SQL_DATA_DIR = $OBSERVER_DIR/data_for_mysqltest_file_sql;
+set session enable_file_sql = ON;
+--echo # Cross-format INNER JOIN
+ eval select c.id, c.name, j.score
+ from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c
+ inner join read_ndjson('$FILE_SQL_DATA_DIR/basic.jsonl') j on c.id = j.id
+ where c.id >= 2 order by c.id;
+--echo # LEFT JOIN keeps the unmatched row
+ eval select c.id, j.name from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c
+ left join read_json('$FILE_SQL_DATA_DIR/basic.jsonl') j on c.id = j.id and j.id < 3
+ order by c.id;
+--echo # Cross-format Parquet JOIN and projected columns
+ eval select p.c1, c.name from read_parquet('$FILE_SQL_DATA_DIR/simple.parquet') p
+ join read_csv('$FILE_SQL_DATA_DIR/basic.csv') c on p.c1 = c.id order by p.c1;
+--echo # Aggregate, HAVING, expression, sorting and LIMIT
+ eval select active, count(*) as n, sum(id) as total from read_csv('$FILE_SQL_DATA_DIR/basic.csv')
+ group by active having count(*) > 1 order by total desc limit 1;
+ eval select id * 2 as doubled, upper(name) as label from read_csv('$FILE_SQL_DATA_DIR/basic.csv')
+ where score > 90 order by id desc limit 1;
+--echo # Self cross JOIN must support independent cursors and rescan
+ eval select count(*) as pairs, sum(a.id+b.id) as total from read_csv('$FILE_SQL_DATA_DIR/basic.csv') a
+ cross join read_csv('$FILE_SQL_DATA_DIR/basic.csv') b;
+--echo # sample_size must be exactly negative one
+--disable_result_log
+--error 1235
+ eval select * from read_csv('$FILE_SQL_DATA_DIR/basic.csv', sample_size = 1);
+--enable_result_log
+set session enable_file_sql = OFF;
+--enable_query_log
+--source mysql_test/test_suite/file_sql/include/remove_file_sql_data.inc

@@ -330,7 +330,8 @@ bool ThriftCompactReader::skip_field(int8_t type)
 // ------------------------------------------------------------------ snappy
 //
 
-bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<unsigned char> &dst)
+bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<unsigned char> &dst,
+                       size_t max_output_size)
 {
   dst.clear();
   if (src_size == 0) {
@@ -341,6 +342,7 @@ bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<un
   int shift = 0;
   while (pos < src_size) {
     const unsigned char byte = src[pos++];
+    if (shift == 63 && (byte & 0xFE) != 0) { return false; }
     expected |= static_cast<uint64_t>(byte & 0x7F) << shift;
     if (0 == (byte & 0x80)) {
       break;
@@ -350,6 +352,7 @@ bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<un
       return false;
     }
   }
+  if ((src[pos - 1] & 0x80) != 0 || expected > max_output_size) { return false; }
   dst.reserve(static_cast<size_t>(expected));
   while (pos < src_size) {
     const unsigned char tag = src[pos++];
@@ -368,7 +371,7 @@ bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<un
         pos += extra;
         length += 1;
       }
-      if (pos + length > src_size) {
+      if (length > src_size - pos || length > expected - dst.size()) {
         return false;
       }
       dst.insert(dst.end(), src + pos, src + pos + length);
@@ -400,7 +403,7 @@ bool snappy_uncompress(const unsigned char *src, size_t src_size, std::vector<un
                | (static_cast<uint64_t>(src[pos + 2]) << 16) | (static_cast<uint64_t>(src[pos + 3]) << 24);
       pos += 4;
     }
-    if (0 == offset || offset > dst.size()) {
+    if (0 == offset || offset > dst.size() || length > expected - dst.size()) {
       return false;
     }
     size_t from = dst.size() - static_cast<size_t>(offset);
@@ -422,7 +425,11 @@ bool decode_rle_hybrid(const unsigned char *data,
                        std::vector<int32_t> &values,
                        size_t &consumed)
 {
-  const uint64_t mask = (bit_width >= 64) ? ~0ULL : ((1ULL << bit_width) - 1);
+  consumed = 0;
+  if (bit_width < 0 || bit_width > 32 || count < 0 || (data_size > 0 && NULL == data)) {
+    return false;
+  }
+  const uint64_t mask = (1ULL << bit_width) - 1;
   const size_t value_bytes = (bit_width + 7) / 8;
   size_t pos = 0;
   while (static_cast<int64_t>(values.size()) < count && pos < data_size) {
@@ -431,6 +438,9 @@ bool decode_rle_hybrid(const unsigned char *data,
     bool done = false;
     while (pos < data_size) {
       const unsigned char byte = data[pos++];
+      if (shift > 63 || (shift == 63 && (byte & 0xFE) != 0)) {
+        return false;
+      }
       header |= static_cast<uint64_t>(byte & 0x7F) << shift;
       if (0 == (byte & 0x80)) {
         done = true;
@@ -438,8 +448,8 @@ bool decode_rle_hybrid(const unsigned char *data,
       }
       shift += 7;
     }
-    if (!done) {
-      break;
+    if (!done || (header >> 1) == 0) {
+      return false;
     }
     if (0 == (header & 1)) {
       // run length encoded run
@@ -458,12 +468,15 @@ bool decode_rle_hybrid(const unsigned char *data,
       continue;
     }
     // bit packed run
-    const int64_t groups = static_cast<int64_t>(header >> 1);
-    const int64_t packed_values = groups * 8;
-    const size_t needed = static_cast<size_t>(groups) * value_bytes;
-    if (pos + needed > data_size) {
-      break;
+    const uint64_t groups = header >> 1;
+    // Each group contains eight values: eight * width bits == width bytes.
+    // Divide before multiplying, and bound the logical count before conversion.
+    if (groups > static_cast<uint64_t>(INT64_MAX / 8)
+        || (bit_width > 0 && groups > (data_size - pos) / static_cast<size_t>(bit_width))) {
+      return false;
     }
+    const int64_t packed_values = static_cast<int64_t>(groups * 8);
+    const size_t needed = static_cast<size_t>(groups) * static_cast<size_t>(bit_width);
     uint64_t buffer = 0;
     int bits = 0;
     size_t buffer_pos = pos;

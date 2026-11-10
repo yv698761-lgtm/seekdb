@@ -565,7 +565,7 @@ END_P SET_VAR DELIMITER
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> file_table_expr file_table_arg_list file_table_arg file_table_arg_name file_table_arg_value
-%type <node> copy_stmt copy_option_list copy_option_item copy_option_item_list
+%type <node> copy_stmt copy_source copy_option_list copy_option_item copy_option_item_list
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -17710,25 +17710,54 @@ literal
 ;
 
 copy_stmt:
-COPY '(' select_no_parens ')' TO STRING_VALUE copy_option_list
+COPY copy_source TO STRING_VALUE copy_option_list
 {
-  ParseNode *select_node = $3;
+  ParseNode *select_node = $2;
   ParseNode *format_node = NULL;
   ParseNode *into_node = NULL;
   if (NULL == select_node) {
     yyerror(NULL, result, "invalid copy statement");
     $$ = NULL;
   } else {
-    merge_nodes(format_node, result, T_EXTERNAL_FILE_FORMAT, $7);
-    malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $6, format_node, NULL);
+    merge_nodes(format_node, result, T_EXTERNAL_FILE_FORMAT, $5);
+    malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $4, format_node, NULL);
     select_node->children_[PARSE_SELECT_INTO] = into_node;
     $$ = select_node;
   }
 }
 ;
 
+copy_source:
+'(' select_no_parens ')' { $$ = $2; }
+| relation_factor
+{
+  ParseNode *star = NULL;
+  ParseNode *project = NULL;
+  ParseNode *project_list = NULL;
+  ParseNode *table = NULL;
+  ParseNode *from_list = NULL;
+  malloc_terminal_node(star, result->malloc_pool_, T_STAR);
+  malloc_non_terminal_node(project, result->malloc_pool_, T_PROJECT_STRING, 1, star);
+  dup_string_to_node(project, result->malloc_pool_, "*");
+  merge_nodes(project_list, result, T_PROJECT_LIST, project);
+  malloc_non_terminal_node(table, result->malloc_pool_, T_ORG, 4, $1, NULL, NULL, NULL);
+  merge_nodes(from_list, result, T_FROM_LIST, table);
+  malloc_select_node($$, result->malloc_pool_);
+  $$->children_[PARSE_SELECT_SELECT] = project_list;
+  $$->children_[PARSE_SELECT_FROM] = from_list;
+}
+;
+
 copy_option_list:
-'(' copy_option_item_list ')'
+/* EMPTY */
+{
+  // Keep an explicit COPY option even when defaults are used, so the resolver
+  // cannot mistake COPY for ordinary SELECT INTO OUTFILE.
+  ParseNode *name = NULL;
+  make_name_node(name, result->malloc_pool_, "__copy");
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 1, name);
+}
+| '(' copy_option_item_list ')'
 {
   $$ = $2;
 }
@@ -17746,7 +17775,17 @@ copy_option_item
 ;
 
 copy_option_item:
-NAME_OB
+NAME_OB BOOL_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $2);
+}
+| unreserved_keyword BOOL_VALUE
+{
+  ParseNode *name_node = NULL;
+  get_non_reserved_node(name_node, result->malloc_pool_, @1.first_column, @1.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, name_node, $2);
+}
+| NAME_OB
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 1, $1);
 }

@@ -40,8 +40,9 @@ namespace file_source {
 ///     are supported for the data and the definition levels,
 ///   * data pages of type `DATA_PAGE` and `DATA_PAGE_V2` are supported.
 ///
-/// Only the pages of the requested row groups are read from the file, the
-/// decoded values are kept per row group only.
+/// Only projected column pages are read. Each selected column retains at most
+/// one bounded decoded page and its dictionary; no whole row group or chunk is
+/// materialized. Page/header resource limits reject oversized untrusted inputs.
 class FileParquetReader
 {
 public:
@@ -64,8 +65,17 @@ public:
 
 private:
   FileSourceError read_footer();
-  FileSourceError decode_row_group(int64_t row_group_index, std::vector<std::vector<std::string>> &values,
-                                   std::vector<std::vector<bool>> &nulls) const;
+  FileSourceError start_row_group(int64_t index);
+  FileSourceError read_column_page(size_t column);
+  struct ColumnCursor {
+    int64_t offset = 0;
+    int64_t end = 0;
+    int64_t values_read = 0;
+    size_t row = 0;
+    std::vector<std::string> dictionary;
+    std::vector<std::string> values;
+    std::vector<bool> nulls;
+  };
 
 private:
   std::string path_;
@@ -88,10 +98,11 @@ private:
   int64_t current_row_ = 0;
   /// Number of rows of the current row group.
   int64_t current_row_count_ = 0;
-  /// Decoded values of the current row group, one vector per column.
-  std::vector<std::vector<std::string>> current_values_;
-  /// Null flags of the current row group, one vector per column.
-  std::vector<std::vector<bool>> current_nulls_;
+  /// One page and dictionary per projected column, never a whole row group.
+  std::vector<ColumnCursor> cursors_;
+  std::vector<size_t> selected_columns_;
+  FILE *file_ = NULL;
+  int64_t emitted_ = 0;
 };
 
 }  // namespace file_source

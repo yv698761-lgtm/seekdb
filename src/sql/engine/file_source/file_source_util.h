@@ -19,6 +19,7 @@
 
 #include "sql/engine/file_source/file_source_def.h"
 
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,17 @@ bool normalize_path(const std::string &path, std::string &result);
 
 /// Make the path absolute using the current working directory.
 bool absolute_path(const std::string &path, std::string &result);
+
+/// Resolve symlinks in an existing path. Unlike normalize_path, this preserves
+/// the filesystem meaning of a symlink followed by `..`.
+bool canonical_path(const std::string &path, std::string &result);
+
+/// Open an actual regular file and retain the validated descriptor. On POSIX,
+/// component-wise O_NOFOLLOW opens prevent a symlink substitution after validation.
+/// An empty restriction is for callers that already enforce their own policy.
+FileSourceError open_regular_file(const std::string &path, const std::string &secure_file_priv,
+                                 FILE *&file, FileSignature &signature);
+bool get_open_file_signature(FILE *file, FileSignature &signature);
 
 /// Check the path against the `secure_file_priv` restriction.
 ///

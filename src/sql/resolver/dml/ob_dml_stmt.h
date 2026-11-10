@@ -160,6 +160,8 @@ struct TableItem
     file_has_header_ = 1;
     file_sample_size_ = -1;
     file_delimiter_ = ',';
+    file_quote_ = '"';
+    file_escape_ = '\\';
     file_describe_ = false;
   }
 
@@ -315,10 +317,13 @@ struct TableItem
   // file table function infos, e.g. read_csv()/read_json()/read_parquet()/glob()
   common::ObString file_path_;
   common::ObString file_null_string_;
+  common::ObString file_schema_fingerprint_;
   int32_t file_format_;
   int32_t file_has_header_;
   int64_t file_sample_size_;
   char file_delimiter_;
+  char file_quote_;
+  char file_escape_;
   bool file_describe_;
 };
 

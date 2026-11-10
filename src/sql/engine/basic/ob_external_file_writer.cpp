@@ -19,6 +19,12 @@
 #include "ob_external_file_writer.h"
 #include "ob_select_into_basic.h"
 #include "lib/alloc/alloc_struct.h"
+#include <cerrno>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace oceanbase
 {
@@ -32,6 +38,7 @@ int ObExternalFileWriter::open_file()
   if (OB_FAIL(file_appender_.create(url_, true))) {
   } else {
     is_file_opened_ = true;
+    owns_file_ = true;
   }
   return ret;
 }
@@ -55,6 +62,29 @@ int ObExternalFileWriter::close_data_writer()
   int ret = OB_SUCCESS;
   OZ(write_file());
   OZ(close_file());
+  if (OB_SUCC(ret)) {
+    owns_file_ = false;
+  }
+  return ret;
+}
+
+int ObExternalFileWriter::abort_file()
+{
+  int ret = OB_SUCCESS;
+  // Do not flush buffered rows or finish compression after a failed query.
+  // In particular, failed O_EXCL creation never grants ownership of the path.
+  file_appender_.close();
+  is_file_opened_ = false;
+  if (owns_file_) {
+    ObSqlString path;
+    if (OB_FAIL(path.append(url_))) {
+    } else if (0 != ::unlink(path.ptr())) {
+      ret = OB_IO_ERROR;
+      LOG_WARN("failed to remove incomplete COPY output", K(ret), K(url_), K(errno));
+    } else {
+      owns_file_ = false;
+    }
+  }
   return ret;
 }
 

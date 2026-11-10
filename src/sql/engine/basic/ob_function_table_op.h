@@ -38,12 +38,13 @@ class ObFunctionTableSpec : public ObOpSpec
 OB_UNIS_VERSION_V(1);
 public:
   ObFunctionTableSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
-    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), has_correlated_expr_(false),
+    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), file_column_indices_(alloc), has_correlated_expr_(false),
       file_path_(), file_format_(0), file_has_header_(-1), file_sample_size_(-1),
-      file_delimiter_(0), file_describe_(false)
+      file_delimiter_(0), file_quote_('"'), file_escape_('\\'), file_describe_(false)
   {}
   ObExpr *value_expr_;
   common::ObFixedArray<ObExpr*, common::ObIAllocator> column_exprs_;
+  common::ObFixedArray<int64_t, common::ObIAllocator> file_column_indices_;
   bool has_correlated_expr_;
   // the file table function scans a local file
   common::ObString file_path_;
@@ -51,8 +52,11 @@ public:
   int32_t file_has_header_;
   int64_t file_sample_size_;
   int32_t file_delimiter_;
+  int32_t file_quote_;
+  int32_t file_escape_;
   bool file_describe_;
   common::ObString file_null_string_;
+  common::ObString file_schema_fingerprint_;
 };
 
 class ObFunctionTableOp : public ObOperator

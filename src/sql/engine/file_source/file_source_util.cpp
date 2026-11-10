@@ -20,6 +20,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <fcntl.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include <sys/stat.h>
 
 #if defined(_WIN32)
@@ -281,48 +286,125 @@ bool absolute_path(const std::string &path, std::string &result)
   return normalize_path(cwd + "/" + path, result);
 }
 
+bool canonical_path(const std::string &path, std::string &result)
+{
+  if (path.empty() || path.find('\0') != std::string::npos) {
+    return false;
+  }
+#if defined(_WIN32)
+  HANDLE handle = CreateFileA(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  if (INVALID_HANDLE_VALUE == handle) { return false; }
+  char buffer[32768];
+  DWORD length = GetFinalPathNameByHandleA(handle, buffer, sizeof(buffer), FILE_NAME_NORMALIZED);
+  CloseHandle(handle);
+  if (length == 0 || length >= sizeof(buffer)) { return false; }
+  result.assign(buffer, length);
+  if (result.compare(0, 4, "\\\\?\\") == 0) { result.erase(0, 4); }
+  std::replace(result.begin(), result.end(), '\\', '/');
+  std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return ::tolower(c); });
+#else
+  char *resolved = ::realpath(path.c_str(), NULL);
+  if (NULL == resolved) { return false; }
+  result = resolved;
+  ::free(resolved);
+#endif
+  return true;
+}
+
 bool check_secure_path(const std::string &secure_file_priv, const std::string &path, std::string &error)
 {
   if (secure_file_priv.empty() || path_equals_ignore_case(secure_file_priv, kNullFilePriv)) {
     error = "Access denied, please set suitable variable 'secure_file_priv' first";
     return false;
   }
-  std::string normalized_priv;
-  std::string normalized_path;
-  if (!normalize_path(secure_file_priv, normalized_priv) || !normalize_path(path, normalized_path)) {
-    error = "Access denied, invalid file path";
+  std::string root;
+  std::string target;
+  // For patterns authorize the existing prefix only. Every actual glob match
+  // MUST be checked separately; a wildcard can match an escaping symlink.
+  std::string prefix = path;
+  const size_t wildcard = prefix.find_first_of("*?");
+  if (wildcard != std::string::npos) {
+    const size_t slash = prefix.find_last_of("/\\", wildcard);
+    prefix = slash == std::string::npos ? "." : prefix.substr(0, slash + 1);
+  }
+  if (!canonical_path(secure_file_priv, root) || !canonical_path(prefix, target)) {
+    error = "Access denied, cannot resolve actual file path";
     return false;
   }
-  if (!normalized_path.empty() && normalized_path[0] != '/') {
-    std::string absolute;
-    if (!absolute_path(path, absolute)) {
-      error = "Access denied, invalid file path";
-      return false;
-    }
-    normalized_path = absolute;
-  }
-  if (!normalized_priv.empty() && normalized_priv[0] != '/') {
-    std::string absolute;
-    if (!absolute_path(secure_file_priv, absolute)) {
-      error = "Access denied, invalid secure_file_priv";
-      return false;
-    }
-    normalized_priv = absolute;
-  }
-  // the root directory allows every absolute path
-  if ("/" == normalized_priv) {
+  if (root == target || root == "/"
+      || (target.size() > root.size() && target.compare(0, root.size(), root) == 0
+          && (root.back() == '/' || target[root.size()] == '/'))) {
     return true;
-  }
-  if (0 == normalized_path.compare(0, normalized_priv.size(), normalized_priv)) {
-    if (normalized_path.size() == normalized_priv.size()) {
-      return true;
-    }
-    if ('/' == normalized_path[normalized_priv.size()]) {
-      return true;
-    }
   }
   error = "Access denied for file path, please check the 'secure_file_priv' setting";
   return false;
+}
+
+bool get_open_file_signature(FILE *file, FileSignature &signature)
+{
+  struct stat st;
+#if defined(_WIN32)
+  if (NULL == file || 0 != ::fstat(_fileno(file), &st)) { return false; }
+#else
+  if (NULL == file || 0 != ::fstat(fileno(file), &st)) { return false; }
+#endif
+  if ((st.st_mode & S_IFMT) != S_IFREG) { return false; }
+  signature.device = static_cast<uint64_t>(st.st_dev);
+  signature.inode = static_cast<uint64_t>(st.st_ino);
+  signature.size = st.st_size;
+  signature.mtime_sec = st.st_mtime;
+#if defined(__APPLE__)
+  signature.mtime_nsec = st.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+  signature.mtime_nsec = 0;
+#else
+  signature.mtime_nsec = st.st_mtim.tv_nsec;
+#endif
+  return true;
+}
+
+FileSourceError open_regular_file(const std::string &path, const std::string &secure_file_priv,
+                                 FILE *&file, FileSignature &signature)
+{
+  file = NULL;
+  std::string target;
+  std::string error;
+  if (!canonical_path(path, target)) {
+    return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot resolve file '" + path + "'");
+  }
+  if (!secure_file_priv.empty() && !check_secure_path(secure_file_priv, target, error)) {
+    return FileSourceError(FileErrorCode::PATH_NOT_ALLOWED, error);
+  }
+#if defined(_WIN32)
+  file = std::fopen(target.c_str(), "rb");
+#else
+  // Walk the resolved absolute path from an anchored directory descriptor.
+  // O_NONBLOCK prevents FIFO/device substitutions from blocking before fstat.
+  int fd = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  size_t begin = 1;
+  while (fd >= 0 && begin < target.size()) {
+    const size_t end = target.find('/', begin);
+    const bool last = end == std::string::npos;
+    const std::string component = target.substr(begin, last ? end : end - begin);
+    const int next = ::openat(fd, component.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+                             | (last ? O_NONBLOCK : O_DIRECTORY));
+    ::close(fd);
+    fd = next;
+    if (last) { break; }
+    begin = end + 1;
+  }
+  if (fd >= 0) {
+    struct stat st;
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { ::close(fd); }
+    else { file = ::fdopen(fd, "rb"); if (NULL == file) { ::close(fd); } }
+  }
+#endif
+  if (NULL == file || !get_open_file_signature(file, signature)) {
+    if (NULL != file) { std::fclose(file); file = NULL; }
+    return FileSourceError(FileErrorCode::IO_ERROR, "cannot open regular file '" + path + "'");
+  }
+  return FileSourceError();
 }
 
 bool get_file_signature(const std::string &path, FileSignature &signature)
@@ -331,6 +413,9 @@ bool get_file_signature(const std::string &path, FileSignature &signature)
   if (0 != ::stat(path.c_str(), &st)) {
     return false;
   }
+  if ((st.st_mode & S_IFMT) != S_IFREG) { return false; }
+  signature.device = static_cast<uint64_t>(st.st_dev);
+  signature.inode = static_cast<uint64_t>(st.st_ino);
   signature.size = static_cast<int64_t>(st.st_size);
   signature.mtime_sec = static_cast<int64_t>(st.st_mtime);
 #if defined(__APPLE__)
@@ -349,7 +434,7 @@ bool is_regular_file(const std::string &path)
   if (0 != ::stat(path.c_str(), &st)) {
     return false;
   }
-  return 0 != (st.st_mode & S_IFREG);
+  return (st.st_mode & S_IFMT) == S_IFREG;
 }
 
 std::string file_extension(const std::string &path)

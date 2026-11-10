@@ -18,6 +18,7 @@
 #include "sql/engine/file_source/file_type_inference.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -27,8 +28,6 @@ namespace sql {
 namespace file_source {
 
 namespace {
-
-bool is_space_char(char c) { return ' ' == c || '\t' == c; }
 
 bool is_digit_char(char c) { return c >= '0' && c <= '9'; }
 
@@ -98,7 +97,8 @@ bool parse_int64(const std::string &text, int64_t &value)
     return false;
   }
   if (negative) {
-    value = (0 == magnitude) ? 0 : -static_cast<int64_t>(magnitude);
+    value = (magnitude == limit) ? std::numeric_limits<int64_t>::min()
+                                 : -static_cast<int64_t>(magnitude);
   } else {
     value = static_cast<int64_t>(magnitude);
   }
@@ -114,7 +114,8 @@ bool parse_double(const std::string &text, double &value)
   errno = 0;
   char *endptr = NULL;
   const double parsed = std::strtod(text.c_str(), &endptr);
-  if (NULL == endptr || endptr != text.c_str() + text.size()) {
+  if (ERANGE == errno || !std::isfinite(parsed)
+      || NULL == endptr || endptr != text.c_str() + text.size()) {
     return false;
   }
   value = parsed;
@@ -214,7 +215,7 @@ bool ColumnTypeAccumulator::is_datetime_literal(const std::string &text)
   const int hour = (text[pos] - '0') * 10 + (text[pos + 1] - '0');
   const int minute = (text[pos + 3] - '0') * 10 + (text[pos + 4] - '0');
   const int second = (text[pos + 6] - '0') * 10 + (text[pos + 7] - '0');
-  if (hour > 23 || minute > 59 || second > 60) {
+  if (hour > 23 || minute > 59 || second > 59) {
     return false;
   }
   pos += 8;
@@ -230,13 +231,14 @@ bool ColumnTypeAccumulator::is_datetime_literal(const std::string &text)
     ++pos;
     ++fraction_len;
   }
-  return fraction_len > 0 && pos == text.size();
+  return fraction_len > 0 && fraction_len <= 6 && pos == text.size();
 }
 
 ColumnType ColumnTypeAccumulator::infer_literal_type(const std::string &text)
 {
   if (text.empty()) {
-    return ColumnType::NULL_TYPE;
+    // NULL is supplied explicitly via feed_null(); an empty value is a string.
+    return ColumnType::VARCHAR;
   }
   // boolean literals, case insensitive
   if (infer_equals_ignore_case(text, "true") || infer_equals_ignore_case(text, "false")) {

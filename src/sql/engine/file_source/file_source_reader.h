@@ -50,7 +50,7 @@ public:
   FileSourceError open(const std::string &path, const FileReadOptions &options);
   /// Open the glob mode, every file that matches the pattern is reported as
   /// one row with a single `file` column.
-  FileSourceError open_glob(const std::string &pattern);
+  FileSourceError open_glob(const std::string &pattern, const std::string &secure_file_priv = "");
   /// Infer the schema of the opened file.
   FileSourceError infer_schema(FileSchema &schema);
   /// Read the next row of the file.

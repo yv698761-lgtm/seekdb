@@ -19,6 +19,7 @@
 #include "sql/engine/file_source/file_parquet_format.h"
 #include "sql/engine/file_source/file_source_util.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,7 +87,11 @@ bool read_file_range(FILE *file, int64_t offset, int64_t length, std::vector<uns
   if (0 == length) {
     return true;
   }
-  if (0 != ::fseek(file, static_cast<long>(offset), SEEK_SET)) {
+  #if defined(_WIN32)
+  if (0 != ::_fseeki64(file, offset, SEEK_SET)) {
+#else
+  if (0 != ::fseeko(file, static_cast<off_t>(offset), SEEK_SET)) {
+#endif
     return false;
   }
   const size_t read = std::fread(&buffer[0], 1, static_cast<size_t>(length), file);
@@ -184,7 +189,30 @@ bool read_schema_element(ThriftCompactReader &reader, ParquetSchemaNode &node)
         }
         if (!member_stop) {
           node.logical_type_kind = member_id;
-          if (!reader.skip_field(member_type)) {
+          if (member_id == kReaderLogicalTimestamp) {
+            if (member_type != 12) { return false; }
+            reader.push_struct();
+            bool found_unit = false;
+            while (true) {
+              int16_t id = 0; int8_t type = 0; bool stop = false;
+              if (!reader.read_field_begin(id, type, stop)) { return false; }
+              if (stop) { break; }
+              if (id == 2) {
+                if (type != 12 || found_unit) { return false; }
+                found_unit = true;
+                reader.push_struct();
+                int16_t unit = 0; int8_t unit_type = 0; bool unit_stop = false;
+                if (!reader.read_field_begin(unit, unit_type, unit_stop) || unit_stop
+                    || unit_type != 12 || unit < 1 || unit > 3
+                    || !reader.skip_field(unit_type)) { return false; }
+                node.timestamp_unit = unit;
+                if (!reader.read_field_begin(unit, unit_type, unit_stop) || !unit_stop) { return false; }
+                reader.pop_struct();
+              } else if (!reader.skip_field(type)) { return false; }
+            }
+            reader.pop_struct();
+            if (!found_unit) { return false; }
+          } else if (!reader.skip_field(member_type)) {
             reader.pop_struct();
             return false;
           }
@@ -636,6 +664,11 @@ bool decode_data_page(const unsigned char *page,
                        std::vector<bool> &nulls,
                        std::string &error)
 {
+  if (header.num_values < 0 || header.definition_levels_byte_length < 0
+      || header.repetition_levels_byte_length < 0) {
+    error = "invalid parquet page value count or level length";
+    return false;
+  }
   const int32_t max_def_level = column.max_def_level;
   const int32_t max_rep_level = column.max_rep_level;
   std::vector<int32_t> definition_levels;
@@ -649,7 +682,7 @@ bool decode_data_page(const unsigned char *page,
       return false;
     }
     payload_size = page_size - payload_pos;
-    if (max_def_level > 0 && header.definition_levels_byte_length > 0) {
+    if (max_def_level > 0) {
       const unsigned char *def_data = page + header.repetition_levels_byte_length;
       size_t consumed = 0;
       if (!decode_rle_hybrid(def_data,
@@ -672,6 +705,10 @@ bool decode_data_page(const unsigned char *page,
       uint32_t length = 0;
       std::memcpy(&length, page + pos, 4);
       pos += 4;
+      if (length > page_size - pos) {
+        error = "the repetition levels of the parquet page are truncated";
+        return false;
+      }
       std::vector<int32_t> repetition_levels;
       size_t consumed = 0;
       if (!decode_rle_hybrid(page + pos, length, bit_width(max_rep_level), header.num_values, repetition_levels,
@@ -689,6 +726,10 @@ bool decode_data_page(const unsigned char *page,
       uint32_t length = 0;
       std::memcpy(&length, page + pos, 4);
       pos += 4;
+      if (length > page_size - pos) {
+        error = "the definition levels of the parquet page are truncated";
+        return false;
+      }
       size_t consumed = 0;
       if (!decode_rle_hybrid(page + pos, length, bit_width(max_def_level), header.num_values, definition_levels,
                              consumed)) {
@@ -704,6 +745,12 @@ bool decode_data_page(const unsigned char *page,
     payload_pos = pos;
     payload_size = page_size - pos;
   }
+  for (int32_t level : definition_levels) {
+    if (level < 0 || level > max_def_level) {
+      error = "invalid parquet definition level";
+      return false;
+    }
+  }
   // the number of values that are not null
   int64_t present = header.num_values;
   if (max_def_level > 0 && !definition_levels.empty()) {
@@ -718,30 +765,37 @@ bool decode_data_page(const unsigned char *page,
       (kReaderEncodingPlainDictionary == header.encoding || kReaderEncodingRleDictionary == header.encoding);
   std::vector<std::string> decoded;
   if (dictionary_encoded) {
-    if (dictionary.empty()) {
+    if (dictionary.empty() && present > 0) {
       error = "the parquet page uses a dictionary encoding but the file has no dictionary page";
       return false;
     }
     const unsigned char *index_data = page + payload_pos;
     size_t index_size = payload_size;
-    if (index_size < 1) {
+    if (index_size < 1 && present > 0) {
       error = "the dictionary indices of the parquet page are truncated";
       return false;
     }
-    const int32_t width = index_data[0];
+    const int32_t width = index_size == 0 ? 0 : index_data[0];
     std::vector<int32_t> indices;
     size_t consumed = 0;
-    if (!decode_rle_hybrid(index_data + 1, index_size - 1, width, present, indices, consumed)) {
+    if (present > 0 && !decode_rle_hybrid(index_data + 1, index_size - 1, width, present, indices, consumed)) {
       error = "failed to decode the dictionary indices of the parquet page";
       return false;
     }
+    size_t decoded_bytes = 0;
     for (int64_t i = 0; i < present; ++i) {
       const int32_t index = indices[static_cast<size_t>(i)];
       if (index < 0 || static_cast<size_t>(index) >= dictionary.size()) {
         error = "the dictionary index of the parquet page is out of range";
         return false;
       }
-      decoded.push_back(dictionary[static_cast<size_t>(index)]);
+      const std::string &value = dictionary[static_cast<size_t>(index)];
+      if (value.size() > 64 * 1024 * 1024 - decoded_bytes) {
+        error = "dictionary expansion exceeds bounded parquet page budget";
+        return false;
+      }
+      decoded_bytes += value.size();
+      decoded.push_back(value);
     }
   } else if (kReaderEncodingPlain == header.encoding) {
     if (!decode_plain_values(page + payload_pos,
@@ -770,7 +824,7 @@ bool decode_data_page(const unsigned char *page,
       continue;
     }
     if (value_index < decoded.size()) {
-      values.push_back(decoded[value_index++]);
+      values.push_back(std::move(decoded[value_index++]));
     } else {
       values.push_back(std::string());
     }
@@ -783,23 +837,41 @@ bool decode_data_page(const unsigned char *page,
 
 FileParquetReader::FileParquetReader() {}
 
-FileParquetReader::~FileParquetReader() {}
+FileParquetReader::~FileParquetReader() { if (file_ != NULL) { std::fclose(file_); } }
 
 FileSourceError FileParquetReader::open(const std::string &path, const FileReadOptions &options)
 {
+  if (file_ != NULL) { std::fclose(file_); file_ = NULL; }
+  opened_ = false;
   path_ = path;
   options_ = options;
-  if (!get_file_signature(path_, signature_)) {
-    return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot stat file '" + path + "'");
+  footer_.clear(); schema_nodes_.clear(); columns_.clear(); row_groups_.clear();
+  cursors_.clear(); selected_columns_.clear();
+  current_group_ = current_row_ = current_row_count_ = emitted_ = 0;
+  FileSourceError error = open_regular_file(path, options.secure_file_priv, file_, signature_);
+  if (!error.is_ok()) { return error; }
+  error = read_footer();
+  if (!error.is_ok()) { return error; }
+  if (options.projection_enabled) {
+    for (int64_t c : options.projected_column_indices) {
+      if (c < 0 || static_cast<size_t>(c) >= columns_.size()) {
+        return FileSourceError(FileErrorCode::SCHEMA_MISMATCH, "parquet projection index is out of range");
+      }
+      selected_columns_.push_back(static_cast<size_t>(c));
+    }
+    std::sort(selected_columns_.begin(), selected_columns_.end());
+    selected_columns_.erase(std::unique(selected_columns_.begin(), selected_columns_.end()), selected_columns_.end());
+  } else {
+    for (size_t c = 0; c < columns_.size(); ++c) { selected_columns_.push_back(c); }
   }
   opened_ = true;
-  return read_footer();
+  return FileSourceError();
 }
 
 FileSourceError FileParquetReader::check_unchanged() const
 {
   FileSignature current;
-  if (!get_file_signature(path_, current)) {
+  if (!get_open_file_signature(file_, current)) {
     return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot stat file '" + path_ + "'");
   }
   if (!(current == signature_)) {
@@ -810,27 +882,23 @@ FileSourceError FileParquetReader::check_unchanged() const
 
 FileSourceError FileParquetReader::read_footer()
 {
-  FILE *file = std::fopen(path_.c_str(), "rb");
-  if (NULL == file) {
-    return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot open file '" + path_ + "'");
-  }
+  FILE *file = file_;
   FileSourceError result;
   std::vector<unsigned char> tail;
   if (!read_file_range(file, signature_.size - 8, 8, tail) || 0 != std::memcmp(&tail[4], kReaderParquetMagic, 4)) {
-    std::fclose(file);
     return FileSourceError(FileErrorCode::PARSE_ERROR, "the file '" + path_ + "' is not a parquet file");
   }
   uint32_t footer_size = 0;
   std::memcpy(&footer_size, &tail[0], 4);
-  if (static_cast<int64_t>(footer_size) + 8 > signature_.size) {
-    std::fclose(file);
+  if (footer_size > 64 * 1024 * 1024) {
+    return FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "parquet footer exceeds bounded reader budget");
+  }
+  if (static_cast<int64_t>(footer_size) + 12 > signature_.size) {
     return FileSourceError(FileErrorCode::PARSE_ERROR, "the footer of '" + path_ + "' is corrupted");
   }
   if (!read_file_range(file, signature_.size - 8 - footer_size, footer_size, footer_)) {
-    std::fclose(file);
     return FileSourceError(FileErrorCode::IO_ERROR, "cannot read the footer of '" + path_ + "'");
   }
-  std::fclose(file);
 
   ThriftCompactReader reader(footer_.empty() ? NULL : &footer_[0], footer_.size());
   reader.push_struct();
@@ -890,12 +958,27 @@ FileSourceError FileParquetReader::read_footer()
     }
   }
   reader.pop_struct();
+  if (schema_nodes_.empty() || schema_nodes_[0].num_children < 0
+      || static_cast<size_t>(schema_nodes_[0].num_children) != schema_nodes_.size() - 1) {
+    return FileSourceError(FileErrorCode::NOT_SUPPORTED, "only flat parquet schemas are supported");
+  }
+  int64_t total_rows = 0;
+  for (const ParquetRowGroup &group : row_groups_) {
+    if (group.num_rows < 0 || group.num_rows > INT64_MAX - total_rows) {
+      return FileSourceError(FileErrorCode::PARSE_ERROR, "invalid parquet row group row count");
+    }
+    total_rows += group.num_rows;
+  }
+  if (num_rows_ < 0 || total_rows != num_rows_) {
+    return FileSourceError(FileErrorCode::PARSE_ERROR, "parquet footer row count does not match row groups");
+  }
   // build the leaf columns of the file
   columns_.clear();
   for (size_t i = 0; i < schema_nodes_.size(); ++i) {
     const ParquetSchemaNode &node = schema_nodes_[i];
-    if (node.num_children > 0) {
-      continue;
+    if (i > 0 && (node.num_children != 0 || node.type < 0
+                  || node.repetition_type == static_cast<int32_t>(ParquetRepetition::REPEATED))) {
+      return FileSourceError(FileErrorCode::NOT_SUPPORTED, "nested/repeated parquet columns are not supported");
     }
     if (i == 0) {
       // the root element is never a column
@@ -908,6 +991,22 @@ FileSourceError FileParquetReader::read_footer()
     column.repetition_type = node.repetition_type;
     column.converted_type = node.converted_type;
     column.logical_type_kind = node.logical_type_kind;
+    if (node.logical_type_kind == kReaderLogicalDate) {
+      if (node.type != kReaderTypeInt32 || (node.converted_type != -1 && node.converted_type != kReaderConvertedDate)) {
+        return FileSourceError(FileErrorCode::PARSE_ERROR, "inconsistent parquet DATE annotations");
+      }
+      column.converted_type = kReaderConvertedDate;
+    } else if (node.logical_type_kind == kReaderLogicalTimestamp) {
+      if (node.timestamp_unit == 3) {
+        return FileSourceError(FileErrorCode::NOT_SUPPORTED, "nanosecond parquet timestamps are not supported");
+      }
+      const int32_t converted = node.timestamp_unit == 1 ? kReaderConvertedTimestampMillis : kReaderConvertedTimestampMicros;
+      if (node.type != kReaderTypeInt64 || node.timestamp_unit < 1 || node.timestamp_unit > 2
+          || (node.converted_type != -1 && node.converted_type != converted)) {
+        return FileSourceError(FileErrorCode::PARSE_ERROR, "inconsistent parquet TIMESTAMP annotations");
+      }
+      column.converted_type = converted;
+    }
     column.max_def_level = (static_cast<int32_t>(ParquetRepetition::OPTIONAL) == node.repetition_type) ? 1 : 0;
     column.max_rep_level = (static_cast<int32_t>(ParquetRepetition::REPEATED) == node.repetition_type) ? 1 : 0;
     columns_.push_back(column);
@@ -954,57 +1053,84 @@ FileSourceError FileParquetReader::infer_schema(FileSchema &schema)
   return FileSourceError();
 }
 
-FileSourceError FileParquetReader::decode_row_group(int64_t row_group_index,
-                                                    std::vector<std::vector<std::string>> &values,
-                                                    std::vector<std::vector<bool>> &nulls) const
+FileSourceError FileParquetReader::start_row_group(int64_t index)
 {
-  if (row_group_index < 0 || static_cast<size_t>(row_group_index) >= row_groups_.size()) {
-    return FileSourceError(FileErrorCode::PARSE_ERROR, "the row group does not exist");
+  const ParquetRowGroup &group = row_groups_[static_cast<size_t>(index)];
+  if (group.num_rows < 0 || group.columns.size() != columns_.size()) {
+    return FileSourceError(FileErrorCode::PARSE_ERROR, "invalid parquet row group shape");
   }
-  const ParquetRowGroup &row_group = row_groups_[static_cast<size_t>(row_group_index)];
-  FILE *file = std::fopen(path_.c_str(), "rb");
-  if (NULL == file) {
-    return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot open file '" + path_ + "'");
+  cursors_.clear();
+  cursors_.resize(columns_.size());
+  for (size_t c : selected_columns_) {
+    const ParquetColumnChunk &chunk = group.columns[c];
+    if (columns_[c].max_rep_level != 0 || chunk.num_values != group.num_rows) {
+      return FileSourceError(FileErrorCode::NOT_SUPPORTED, "nested/repeated parquet columns are not supported");
+    }
+    ColumnCursor &cursor = cursors_[c];
+    cursor.offset = chunk.dictionary_page_offset >= 0 ? chunk.dictionary_page_offset : chunk.data_page_offset;
+    if (cursor.offset < 4 || chunk.total_compressed_size <= 0
+        || cursor.offset > signature_.size - chunk.total_compressed_size) {
+      return FileSourceError(FileErrorCode::PARSE_ERROR, "invalid parquet column chunk bounds");
+    }
+    cursor.end = cursor.offset + chunk.total_compressed_size;
+    if (chunk.codec != static_cast<int32_t>(ParquetCodec::SNAPPY)
+        && chunk.codec != static_cast<int32_t>(ParquetCodec::UNCOMPRESSED)) {
+      return FileSourceError(FileErrorCode::NOT_SUPPORTED, "unsupported parquet compression codec");
+    }
   }
-  std::unique_ptr<FILE, int (*)(FILE *)> file_guard(file, std::fclose);
-  values.clear();
-  nulls.clear();
-  for (size_t c = 0; c < columns_.size(); ++c) {
-    const ParquetColumnDesc &column = columns_[c];
-    if (c >= row_group.columns.size()) {
-      return FileSourceError(FileErrorCode::PARSE_ERROR, "the row group does not contain all columns");
-    }
-    const ParquetColumnChunk &chunk = row_group.columns[c];
-    const int64_t start = (chunk.dictionary_page_offset >= 0) ? chunk.dictionary_page_offset : chunk.data_page_offset;
-    const int64_t end = start + chunk.total_compressed_size;
-    if (end <= start) {
-      return FileSourceError(FileErrorCode::PARSE_ERROR, "the column chunk of '" + path_ + "' is corrupted");
-    }
-    std::vector<unsigned char> buffer;
-    if (!read_file_range(file, start, end - start, buffer)) {
-      return FileSourceError(FileErrorCode::IO_ERROR, "cannot read the column chunk of '" + path_ + "'");
-    }
+  current_row_ = 0;
+  current_row_count_ = group.num_rows;
+  return FileSourceError();
+}
 
-    std::vector<std::string> dictionary;
-    std::vector<std::string> column_values;
-    std::vector<bool> column_nulls;
-    size_t pos = 0;
-    int64_t values_read = 0;
-    while (pos < buffer.size() && values_read < chunk.num_values) {
-      ThriftCompactReader reader(&buffer[pos], buffer.size() - pos);
-      PageHeaderInfo header;
-      if (!read_page_header(reader, header)) {
-        return FileSourceError(FileErrorCode::PARSE_ERROR, "the page header of '" + path_ + "' is corrupted");
+FileSourceError FileParquetReader::read_column_page(size_t c)
+{
+  ColumnCursor &cursor = cursors_[c];
+  const ParquetColumnDesc &column = columns_[c];
+  const ParquetColumnChunk &chunk = row_groups_[static_cast<size_t>(current_group_ - 1)].columns[c];
+  cursor.values.clear(); cursor.nulls.clear(); cursor.row = 0;
+  // Hard resource bounds are independent of row-group/chunk sizes. A malformed
+  // page may not force unbounded header, decompression or string allocations.
+  const int64_t max_page_bytes = 64LL * 1024 * 1024;
+  const int64_t max_page_values = 1024 * 1024;
+  while (cursor.offset < cursor.end && cursor.values_read < chunk.num_values) {
+    PageHeaderInfo header;
+    size_t header_size = 0;
+    bool parsed = false;
+    // Headers have no length prefix. Grow a bounded lookahead and never read
+    // an entire chunk just to discover the next page header.
+    for (int64_t lookahead = 256; ; lookahead *= 2) {
+      const int64_t length = std::min<int64_t>(lookahead, cursor.end - cursor.offset);
+      std::vector<unsigned char> header_bytes;
+      if (!read_file_range(file_, cursor.offset, length, header_bytes)) {
+        return FileSourceError(FileErrorCode::IO_ERROR, "cannot read parquet page header");
       }
-      const size_t header_size = reader.position();
-      pos += header_size;
-      if (header.compressed_page_size < 0
-          || pos + static_cast<size_t>(header.compressed_page_size) > buffer.size()) {
-        return FileSourceError(FileErrorCode::PARSE_ERROR, "the page of '" + path_ + "' is truncated");
-      }
-      std::vector<unsigned char> page(buffer.begin() + static_cast<long>(pos),
-                                      buffer.begin() + static_cast<long>(pos + header.compressed_page_size));
-      pos += static_cast<size_t>(header.compressed_page_size);
+      ThriftCompactReader reader(header_bytes.data(), header_bytes.size());
+      if (read_page_header(reader, header)) { header_size = reader.position(); parsed = true; break; }
+      if (lookahead >= 64 * 1024 || length < lookahead) { break; }
+    }
+    if (!parsed || header_size == 0 || header.compressed_page_size < 0
+        || header.uncompressed_page_size < 0 || header.num_values < 0
+        || header.definition_levels_byte_length < 0 || header.repetition_levels_byte_length < 0) {
+      return FileSourceError(FileErrorCode::PARSE_ERROR, "invalid parquet page header");
+    }
+    cursor.offset += header_size;
+    if (header.compressed_page_size > cursor.end - cursor.offset) {
+      return FileSourceError(FileErrorCode::PARSE_ERROR, "truncated parquet page");
+    }
+    if (header.compressed_page_size > max_page_bytes || header.uncompressed_page_size > max_page_bytes
+        || header.num_values > max_page_values) {
+      return FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "parquet page exceeds bounded reader budget");
+    }
+    std::vector<unsigned char> page;
+    if (!read_file_range(file_, cursor.offset, header.compressed_page_size, page)) {
+      return FileSourceError(FileErrorCode::IO_ERROR, "cannot read parquet page");
+    }
+    cursor.offset += header.compressed_page_size;
+    if ((header.page_type == kReaderPageTypeData || header.page_type == kReaderPageTypeDataV2)
+        && header.num_values > chunk.num_values - cursor.values_read) {
+      return FileSourceError(FileErrorCode::PARSE_ERROR, "parquet page exceeds column value count");
+    }
       if (kReaderPageTypeDictionary == header.page_type) {
         // the dictionary page holds the plain encoded dictionary values
         std::vector<unsigned char> plain;
@@ -1015,13 +1141,14 @@ FileSourceError FileParquetReader::decode_row_group(int64_t row_group_index,
         } else {
           plain = page;
         }
+        cursor.dictionary.clear();
         if (!decode_plain_values(plain.empty() ? NULL : &plain[0],
                                  plain.size(),
                                  column.type,
                                  column.type_length,
                                  column.converted_type,
                                  header.num_values,
-                                 dictionary)) {
+                                 cursor.dictionary)) {
           return FileSourceError(FileErrorCode::PARSE_ERROR, "the dictionary page of '" + path_ + "' is corrupted");
         }
         continue;
@@ -1058,9 +1185,9 @@ FileSourceError FileParquetReader::decode_row_group(int64_t row_group_index,
                               header,
                               true,
                               column,
-                              dictionary,
-                              column_values,
-                              column_nulls,
+                              cursor.dictionary,
+                              cursor.values,
+                              cursor.nulls,
                               error)) {
           return FileSourceError(FileErrorCode::PARSE_ERROR, error);
         }
@@ -1079,19 +1206,22 @@ FileSourceError FileParquetReader::decode_row_group(int64_t row_group_index,
                               header,
                               false,
                               column,
-                              dictionary,
-                              column_values,
-                              column_nulls,
+                              cursor.dictionary,
+                              cursor.values,
+                              cursor.nulls,
                               error)) {
           return FileSourceError(FileErrorCode::PARSE_ERROR, error);
         }
       }
-      values_read += header.num_values;
+    cursor.values_read += header.num_values;
+    for (const std::string &value : cursor.values) {
+      if (options_.max_field_size > 0 && value.size() > static_cast<size_t>(options_.max_field_size)) {
+        return FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "parquet field exceeds max_field_size");
+      }
     }
-    values.push_back(column_values);
-    nulls.push_back(column_nulls);
+    if (!cursor.values.empty()) { return FileSourceError(); }
   }
-  return FileSourceError();
+  return FileSourceError(FileErrorCode::PARSE_ERROR, "parquet column ended before row group");
 }
 
 bool FileParquetReader::next_row(FileRow &row, FileSourceError &error)
@@ -1101,78 +1231,38 @@ bool FileParquetReader::next_row(FileRow &row, FileSourceError &error)
     return false;
   }
   while (current_row_ >= current_row_count_) {
-    if (current_group_ >= static_cast<int64_t>(row_groups_.size())) {
-      error = FileSourceError();
-      return false;
-    }
-    std::vector<std::vector<std::string>> values;
-    std::vector<std::vector<bool>> nulls;
-    FileSourceError decode_error = decode_row_group(current_group_, values, nulls);
-    if (!decode_error.is_ok()) {
-      error = decode_error;
-      return false;
-    }
-    current_values_.swap(values);
-    current_nulls_.swap(nulls);
-    current_row_count_ = row_groups_[static_cast<size_t>(current_group_)].num_rows;
-    current_row_ = 0;
-    ++current_group_;
+    if (current_group_ >= static_cast<int64_t>(row_groups_.size())) { error = check_unchanged(); return false; }
+    error = start_row_group(current_group_++);
+    if (!error.is_ok()) { return false; }
   }
-  row.values.clear();
-  row.nulls.clear();
-  for (size_t c = 0; c < columns_.size(); ++c) {
-    const size_t index = static_cast<size_t>(current_row_);
-    if (index >= current_values_[c].size()) {
-      row.values.push_back("");
-      row.nulls.push_back(true);
-      continue;
-    }
-    row.values.push_back(current_values_[c][index]);
-    row.nulls.push_back(current_nulls_[c][index]);
+  if (options_.max_row_count > 0 && emitted_ >= options_.max_row_count) {
+    error = FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "the row limit of the file scan was exceeded");
+    return false;
   }
-  ++current_row_;
+  row.values.assign(columns_.size(), std::string());
+  row.nulls.assign(columns_.size(), true);
+  for (size_t c : selected_columns_) {
+    ColumnCursor &cursor = cursors_[c];
+    if (cursor.row >= cursor.values.size()) {
+      error = read_column_page(c);
+      if (!error.is_ok()) { return false; }
+    }
+    row.values[c] = std::move(cursor.values[cursor.row]);
+    row.nulls[c] = cursor.nulls[cursor.row++];
+  }
+  ++current_row_; ++emitted_;
   error = FileSourceError();
   return true;
 }
 
 FileSourceError FileParquetReader::scan(const FileRowCallback &callback)
 {
-  if (!opened_) {
-    return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "the parquet file was not opened");
-  }
-  int64_t emitted = 0;
-  for (size_t g = 0; g < row_groups_.size(); ++g) {
-    std::vector<std::vector<std::string>> values;
-    std::vector<std::vector<bool>> nulls;
-    FileSourceError error = decode_row_group(static_cast<int64_t>(g), values, nulls);
-    if (!error.is_ok()) {
-      return error;
-    }
-    const int64_t row_count = row_groups_[g].num_rows;
-    FileRow row;
-    for (int64_t r = 0; r < row_count; ++r) {
-      row.values.clear();
-      row.nulls.clear();
-      for (size_t c = 0; c < columns_.size(); ++c) {
-        const size_t index = static_cast<size_t>(r);
-        if (index >= values[c].size()) {
-          row.values.push_back("");
-          row.nulls.push_back(true);
-          continue;
-        }
-        row.values.push_back(values[c][index]);
-        row.nulls.push_back(nulls[c][index]);
-      }
-      ++emitted;
-      if (options_.max_row_count > 0 && emitted > options_.max_row_count) {
-        return FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "the row limit of the file scan was exceeded");
-      }
-      if (!callback(row)) {
-        return FileSourceError();
-      }
-    }
-  }
-  return FileSourceError();
+  current_group_ = current_row_ = current_row_count_ = emitted_ = 0;
+  cursors_.clear();
+  FileRow row;
+  FileSourceError error;
+  while (next_row(row, error)) { if (!callback(row)) { return FileSourceError(); } }
+  return error;
 }
 
 }  // namespace file_source

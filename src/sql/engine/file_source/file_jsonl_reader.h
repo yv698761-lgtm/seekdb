@@ -65,6 +65,7 @@ private:
   FileSchema schema_;
   std::vector<std::string> column_names_;
   bool opened_ = false;
+  int64_t rows_read_ = 0;
   /// Line reader of the streaming read path, owned by the reader.
   LineReader *reader_ = nullptr;
 };

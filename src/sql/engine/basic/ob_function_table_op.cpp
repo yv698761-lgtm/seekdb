@@ -26,6 +26,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -114,7 +115,8 @@ static int file_source_parse_int(const char *value, int32_t len, int64_t &result
     char *endptr = NULL;
     errno = 0;
     long long int_value = strtoll(text.c_str(), &endptr, 10);
-    if (NULL == endptr || endptr == text.c_str() || '\0' != *endptr) {
+    if (ERANGE == errno || NULL == endptr || endptr == text.c_str() || '\0' != *endptr
+        || endptr != text.c_str() + text.size()) {
       ret = OB_ERR_UNEXPECTED;
       LOG_USER_ERROR(OB_ERR_UNEXPECTED, "invalid integer value '%s' in file", text.c_str());
     } else {
@@ -128,10 +130,21 @@ static int file_source_parse_double(const char *value, int32_t len, double &resu
 {
   int ret = OB_SUCCESS;
   std::string text(value, len);
+  std::string lower_text(text);
+  for (size_t i = 0; i < lower_text.size(); ++i) {
+    lower_text[i] = static_cast<char>(::tolower(static_cast<unsigned char>(lower_text[i])));
+  }
+  if ("true" == lower_text || "t" == lower_text) {
+    text = "1";
+  } else if ("false" == lower_text || "f" == lower_text) {
+    text = "0";
+  }
   char *endptr = NULL;
   errno = 0;
   double double_value = strtod(text.c_str(), &endptr);
-  if (NULL == endptr || endptr == text.c_str() || '\0' != *endptr) {
+  if (ERANGE == errno || !std::isfinite(double_value) || NULL == endptr
+      || endptr == text.c_str() || '\0' != *endptr
+      || endptr != text.c_str() + text.size()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_USER_ERROR(OB_ERR_UNEXPECTED, "invalid numeric value '%s' in file", text.c_str());
   } else {
@@ -142,7 +155,8 @@ static int file_source_parse_double(const char *value, int32_t len, double &resu
 
 OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_,
                     file_path_, file_format_, file_has_header_, file_sample_size_, file_delimiter_,
-                    file_describe_, file_null_string_);
+                    file_describe_, file_null_string_, file_column_indices_, file_quote_, file_escape_,
+                    file_schema_fingerprint_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -394,8 +408,23 @@ int ObFunctionTableOp::open_file_source()
   if (OB_SUCC(ret)) {
     file_source::FileReadOptions options;
     options.format = static_cast<file_source::FileFormat>(MY_SPEC.file_format_);
+    ObString secure_file_priv;
+    if (OB_FAIL(ctx_.get_my_session()->get_secure_file_priv(secure_file_priv))) {
+      return ret;
+    }
+    if (!secure_file_priv.empty()) {
+      options.secure_file_priv.assign(secure_file_priv.ptr(), secure_file_priv.length());
+    }
     options.has_header = (MY_SPEC.file_has_header_ < 0) ? true : (0 != MY_SPEC.file_has_header_);
     options.sample_size = MY_SPEC.file_sample_size_;
+    options.quote = static_cast<char>(MY_SPEC.file_quote_);
+    options.escape = static_cast<char>(MY_SPEC.file_escape_);
+    if (!MY_SPEC.file_describe_) {
+      options.projection_enabled = true;
+      for (int64_t i = 0; i < MY_SPEC.file_column_indices_.count(); ++i) {
+        options.projected_column_indices.push_back(MY_SPEC.file_column_indices_.at(i));
+      }
+    }
     if (MY_SPEC.file_delimiter_ > 0) {
       options.delimiter = static_cast<char>(MY_SPEC.file_delimiter_);
     }
@@ -405,7 +434,7 @@ int ObFunctionTableOp::open_file_source()
     const std::string path(MY_SPEC.file_path_.ptr(), MY_SPEC.file_path_.length());
     file_source::FileSourceError error;
     if (file_source::FileFormat::GLOB == options.format) {
-      error = file_ctx_->reader->open_glob(path);
+      error = file_ctx_->reader->open_glob(path, options.secure_file_priv);
     } else {
       error = file_ctx_->reader->open(path, options);
     }
@@ -415,13 +444,22 @@ int ObFunctionTableOp::open_file_source()
     } else if (MY_SPEC.file_describe_) {
       ret = build_describe_rows();
     } else if (file_source::FileFormat::GLOB != options.format) {
-      // Infer the schema of the file so that the columns of the rows are laid out
-      // in the same order as the columns resolved by the resolver.
+      // Validate the full schema before using the cached column ordinals/types.
+      // Projection must not hide changes to unreferenced columns.
       file_source::FileSchema schema;
       file_source::FileSourceError schema_error = file_ctx_->reader->infer_schema(schema);
       if (!schema_error.is_ok()) {
         ret = file_source_error_to_errno(schema_error);
         LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", schema_error.to_string().c_str());
+      } else {
+        const std::string fingerprint = schema.fingerprint();
+        const ObString actual(static_cast<int32_t>(fingerprint.size()), fingerprint.data());
+        if (actual != MY_SPEC.file_schema_fingerprint_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_USER_ERROR(OB_ERR_UNEXPECTED,
+                         "file schema changed since query resolution; reprepare the query");
+          LOG_WARN("file schema fingerprint mismatch", K(ret), K(MY_SPEC.file_path_));
+        }
       }
     }
   }
@@ -508,7 +546,13 @@ int ObFunctionTableOp::inner_get_next_row_file()
       const bool has_row = file_ctx_->reader->next_row(row, error);
       if (!has_row) {
         if (error.is_ok()) {
-          ret = OB_ITER_END;
+          error = file_ctx_->reader->check_unchanged();
+          if (error.is_ok()) {
+            ret = OB_ITER_END;
+          } else {
+            ret = file_source_error_to_errno(error);
+            LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", error.to_string().c_str());
+          }
         } else {
           ret = file_source_error_to_errno(error);
           LOG_USER_ERROR(OB_ERR_UNEXPECTED, "%s", error.to_string().c_str());
@@ -528,11 +572,12 @@ int ObFunctionTableOp::produce_file_row(const file_source::FileRow &row)
   for (int64_t i = 0; OB_SUCC(ret) && i < col_count; ++i) {
     ObExpr * const expr = MY_SPEC.column_exprs_.at(i);
     ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
-    if (i >= static_cast<int64_t>(row.values.size())
-        || (i < static_cast<int64_t>(row.nulls.size()) && row.nulls[i])) {
+    const int64_t idx = MY_SPEC.file_column_indices_.at(i);
+    if (idx < 0 || idx >= static_cast<int64_t>(row.values.size())
+        || (idx < static_cast<int64_t>(row.nulls.size()) && row.nulls[idx])) {
       datum.set_null();
     } else {
-      ret = set_file_datum(expr, datum, row.values[i].c_str(), static_cast<int32_t>(row.values[i].length()));
+      ret = set_file_datum(expr, datum, row.values[idx].c_str(), static_cast<int32_t>(row.values[idx].length()));
     }
     if (OB_SUCC(ret)) {
       expr->set_evaluated_projected(eval_ctx_);

@@ -38,19 +38,25 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_, write_header_, null_str_, column_names_);
+    external_properties_, write_header_, null_str_, column_names_, is_copy_);
 
 
 int ObSelectIntoOp::inner_open()
 {
   int ret = OB_SUCCESS;
   ObSQLSessionInfo *session = NULL;
+  need_commit_ = !MY_SPEC.is_copy_;
   if (OB_ISNULL(session = ctx_.get_my_session())) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     // since we call get_next_row in inner_open, we have to set opened_ first in avoid to a infinite loop.
     opened_ = true;
-    if (OB_FAIL(session->get_sql_select_limit(top_limit_cnt_))) {
+    bool enable_file_sql = false;
+    if (MY_SPEC.is_copy_ && OB_FAIL(session->get_enable_file_sql(enable_file_sql))) {
+    } else if (MY_SPEC.is_copy_ && !enable_file_sql) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "file SQL");
+    } else if (!MY_SPEC.is_copy_ && OB_FAIL(session->get_sql_select_limit(top_limit_cnt_))) {
     }
   }
   if (OB_SUCC(ret) && !MY_SPEC.external_properties_.str_.empty()) {
@@ -227,6 +233,7 @@ int ObSelectIntoOp::inner_get_next_row()
   } //end while
   if (OB_ITER_END == ret || OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
+    need_commit_ = true;
   }
   if (OB_FAIL(ret) && OB_ITER_END != ret) {
     need_commit_ = false;
@@ -309,6 +316,7 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
   } //end while
   if (OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
+    need_commit_ = true;
   }
   if (OB_FAIL(ret)) {
     need_commit_ = false;
@@ -325,7 +333,15 @@ int ObSelectIntoOp::inner_rescan()
 int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
-  if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
+  if (OB_NOT_NULL(data_writer_)) {
+    if (MY_SPEC.is_copy_ && !need_commit_) {
+      ret = data_writer_->abort_file();
+    } else if (OB_FAIL(data_writer_->close_data_writer())) {
+      if (MY_SPEC.is_copy_) {
+        const int cleanup_ret = data_writer_->abort_file();
+        LOG_WARN("failed to finalize COPY output", K(ret), K(cleanup_ret));
+      }
+    }
   }
   return ret;
 }
@@ -933,7 +949,11 @@ int ObSelectIntoOp::write_header_line(ObCsvFileWriter &csv_data_writer)
       = MY_SPEC.column_names_;
   for (int64_t i = 0; OB_SUCC(ret) && i < column_names.count(); ++i) {
     common::ObString column_name = column_names.at(i);
-    if (OB_FAIL(write_str_to_file(column_name, csv_data_writer))) {
+    ObObj header;
+    header.set_varchar(column_name);
+    header.set_collation_type(cs_type_);
+    if (MY_SPEC.is_copy_ ? OB_FAIL(print_field(header, csv_data_writer))
+                         : OB_FAIL(write_str_to_file(column_name, csv_data_writer))) {
     } else if (i != column_names.count() - 1) {
       OZ(write_obj_to_file(field_str_, csv_data_writer));
     }
@@ -952,7 +972,7 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
 {
   int ret = OB_SUCCESS;
   char char_n = 'N';
-  if (obj.is_null() && !MY_SPEC.null_str_.empty()) {
+  if (obj.is_null() && (MY_SPEC.is_copy_ || !MY_SPEC.null_str_.empty())) {
     // the null value is printed as the given null string
     OZ(write_str_to_file(MY_SPEC.null_str_, data_writer));
     return ret;
@@ -965,7 +985,19 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
   }
-  if (!has_escape_) {
+  if (MY_SPEC.is_copy_ && !obj.is_string_type() && !obj.is_json()
+      && !obj.is_collection_sql_type()) {
+    // Escape the textual representation of every type, including numeric values
+    // when a custom quote/escape happens to be a digit.
+    char *buf = NULL;
+    int64_t buf_len = 0;
+    int64_t pos = 0;
+    OZ(print_json_to_json_buf(obj, buf, buf_len, pos, data_writer));
+    ObObj text;
+    text.set_varchar(ObString(pos, buf));
+    text.set_collation_type(cs_type_);
+    OZ(print_str_or_json_with_escape(text, data_writer));
+  } else if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
   } else if (obj.is_null()) {
     OZ(write_single_char_to_file(&char_escape_, data_writer));
@@ -1204,6 +1236,7 @@ int ObSelectIntoOp::prepare_escape_printer()
   OZ(print_wchar_to_buf(buf, buf_len, pos, wchar_line, escape_printer_.line_terminator_, cs_type_));
   OZ(print_wchar_to_buf(buf, buf_len, pos, wchar_replace, escape_printer_.convert_replacer_, cs_type_));
   escape_printer_.coll_type_ = cs_type_;
+  escape_printer_.csv_mode_ = MY_SPEC.is_copy_;
   escape_printer_.ignore_convert_failed_ = true; // todo@linyi provide user-defined interface
   return ret;
 }
@@ -1233,7 +1266,7 @@ int ObSelectIntoOp::create_shared_buffer_for_data_writer()
   if (OB_ISNULL(shared_buf_ = static_cast<char*>(ctx_.get_allocator().alloc(shared_buf_len_)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   }
-  if (OB_SUCC(ret) && (has_json_ || has_coll_) && has_escape_) {
+  if (OB_SUCC(ret) && (MY_SPEC.is_copy_ || has_json_ || has_coll_) && has_escape_) {
     json_buf_len_ = OB_MALLOC_MIDDLE_BLOCK_SIZE;
     if (OB_ISNULL(json_buf_ = static_cast<char*>(ctx_.get_allocator().alloc(json_buf_len_)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -1290,6 +1323,10 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
     if (OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
     }
   }
+  if (OB_SUCC(ret) && MY_SPEC.is_copy_ && MY_SPEC.write_header_ && !header_written_) {
+    OZ(write_header_line(*static_cast<ObCsvFileWriter *>(data_writer)));
+    static_cast<ObCsvFileWriter *>(data_writer)->update_last_line_pos();
+  }
   return ret;
 }
 
@@ -1320,6 +1357,12 @@ int ObSelectIntoOp::new_data_writer(ObExternalFileWriter *&data_writer)
 void ObSelectIntoOp::destroy()
 {
   if (OB_NOT_NULL(data_writer_)) {
+    if (MY_SPEC.is_copy_) {
+      const int ret = data_writer_->abort_file();
+      if (OB_SUCCESS != ret) {
+        LOG_WARN("failed to clean up COPY output", K(ret));
+      }
+    }
     data_writer_->~ObExternalFileWriter();
   }
   external_properties_.~ObExternalFileFormat();

@@ -2248,8 +2248,11 @@ int ObLogPlan::allocate_function_table_path(FunctionTablePath *func_table_path,
       op->set_file_has_header(table_item->file_has_header_);
       op->set_file_sample_size(table_item->file_sample_size_);
       op->set_file_delimiter(static_cast<int32_t>(table_item->file_delimiter_));
+      op->set_file_quote(static_cast<int32_t>(table_item->file_quote_));
+      op->set_file_escape(static_cast<int32_t>(table_item->file_escape_));
       op->set_file_describe(table_item->file_describe_);
       op->set_file_null_string(table_item->file_null_string_);
+      op->set_file_schema_fingerprint(table_item->file_schema_fingerprint_);
     }
     if (OB_FAIL(append(op->get_filter_exprs(), func_table_path->filter_))) {
     } else if (OB_FAIL(op->compute_property(func_table_path))) {
@@ -6841,6 +6844,7 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_cs_type(into_item->cs_type_);
       select_into->set_external_properties(into_item->external_properties_);
       select_into->set_write_header(into_item->write_header_);
+      select_into->set_is_copy(into_item->is_copy_);
       select_into->set_null_str(into_item->null_str_);
       select_into->set_column_names(into_item->column_names_);
       select_into->set_child(ObLogicalOperator::first_child, old_top);

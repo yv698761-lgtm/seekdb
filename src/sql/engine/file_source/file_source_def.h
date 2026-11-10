@@ -114,6 +114,20 @@ struct FileSchema
 {
   std::vector<FileColumn> columns;
 
+  // Exact, order-sensitive schema identity. Length prefixes also preserve names
+  // containing separators or embedded NUL bytes; no lossy hash is involved.
+  std::string fingerprint() const
+  {
+    std::string result = std::to_string(columns.size()) + ":";
+    for (const FileColumn &column : columns) {
+      const std::string type = std::to_string(static_cast<int>(column.type));
+      result += std::to_string(column.name.size()) + ":" + column.name;
+      result += std::to_string(type.size()) + ":" + type;
+      result += column.nullable ? "1:1" : "1:0";
+    }
+    return result;
+  }
+
   int64_t column_count() const { return static_cast<int64_t>(columns.size()); }
   int64_t find_column(const std::string &name) const;
   const FileColumn *column_at(int64_t idx) const;
@@ -123,6 +137,11 @@ struct FileSchema
 struct FileReadOptions
 {
   FileFormat format = FileFormat::AUTO;
+  /// Applied again to the actual descriptor open, not just at SQL resolution.
+  std::string secure_file_priv;
+  /// Unprojected cells remain NULL in schema-width output rows.
+  bool projection_enabled = false;
+  std::vector<int64_t> projected_column_indices;
   /// Whether the first CSV line holds the column names.
   bool has_header = true;
   /// Only `-1` (scan the whole file) is supported, see the task statement.
@@ -156,10 +175,13 @@ struct FileSignature
   int64_t size = -1;
   int64_t mtime_sec = -1;
   int64_t mtime_nsec = -1;
+  uint64_t device = 0;
+  uint64_t inode = 0;
 
   bool operator==(const FileSignature &other) const
   {
-    return size == other.size && mtime_sec == other.mtime_sec && mtime_nsec == other.mtime_nsec;
+    return size == other.size && mtime_sec == other.mtime_sec && mtime_nsec == other.mtime_nsec
+           && device == other.device && inode == other.inode;
   }
 };
 

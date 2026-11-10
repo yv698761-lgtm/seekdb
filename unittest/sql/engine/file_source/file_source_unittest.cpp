@@ -38,6 +38,8 @@
  */
 
 #include "sql/engine/file_source/file_source_reader.h"
+#include "sql/engine/file_source/file_csv_reader.h"
+#include "sql/engine/file_source/file_jsonl_reader.h"
 #include "sql/engine/file_source/file_source_util.h"
 #include "sql/engine/file_source/file_type_inference.h"
 
@@ -141,7 +143,7 @@ std::string base64_decode(const std::string &input)
 {
   static const char *table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::string output;
-  int value = 0;
+  unsigned int value = 0;
   int bits = -8;
   for (size_t i = 0; i < input.size(); ++i) {
     const char c = input[i];
@@ -205,15 +207,234 @@ void test_type_inference()
   check(!parse_file_format("xml", format), "xml is not a supported format");
 }
 
-void test_secure_path()
+void test_inference_boundaries()
+{
+  const char *integers[] = {"-9223372036854775808", "9223372036854775807", "-0"};
+  for (size_t i = 0; i < sizeof(integers) / sizeof(integers[0]); ++i) {
+    check(ColumnTypeAccumulator::infer_literal_type(integers[i]) == ColumnType::BIGINT,
+          std::string("int64 boundary: ") + integers[i]);
+  }
+  const char *strings[] = {"", "1e309", "-1e309", "1e-9999", "NaN", "Infinity",
+                          "2026-08-01 23:59:60", "2026-08-01 24:00:00",
+                          "2026-08-01 12:60:00", "2026-08-01 12:00:00.",
+                          "2026-08-01 12:00:00.1234567", "2025-02-29"};
+  for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); ++i) {
+    check(ColumnTypeAccumulator::infer_literal_type(strings[i]) == ColumnType::VARCHAR,
+          std::string("nonrepresentable literal remains text: ") + strings[i]);
+  }
+  check(ColumnTypeAccumulator::infer_literal_type("9223372036854775808") == ColumnType::DOUBLE,
+        "int64 overflow widens to finite double");
+  check(ColumnTypeAccumulator::infer_literal_type("1.7976931348623157e308") == ColumnType::DOUBLE,
+        "largest finite double is accepted");
+  check(ColumnTypeAccumulator::is_datetime_literal("2024-02-29T23:59:59.123456"),
+        "valid datetime accepts six fractional digits");
+  check(ColumnTypeAccumulator::is_datetime_literal("2024-02-29 00:00:00.1"),
+        "valid datetime accepts one fractional digit");
+  ColumnTypeAccumulator empty;
+  empty.feed_value("");
+  check(empty.type() == ColumnType::VARCHAR && !empty.has_null() && !empty.is_all_null(),
+        "nonnull empty is VARCHAR, not an all-null column");
+}
+
+void test_csv_regressions(const std::string &dir)
+{
+  const std::string path = dir + "/csv_regression.csv";
+  FileReadOptions options;
+  options.has_header = false;
+  write_file(path, "1,\"\"\n2,text\n");
+  FileCsvReader reader;
+  FileSourceError error = reader.open(path, options);
+  check(error.is_ok(), "headerless CSV opens");
+  FileSchema schema;
+  for (int pass = 0; pass < 2; ++pass) {
+    error = reader.infer_schema(schema);
+    check(error.is_ok() && schema.column_count() == 2, "headerless inference is repeatable without duplicate columns");
+  }
+  if (schema.column_count() == 2) {
+    check_eq_str(schema.columns[0].name, "column1", "headerless generated name");
+    check(schema.columns[1].type == ColumnType::VARCHAR && !schema.columns[1].nullable,
+          "quoted empty contributes nonnull VARCHAR");
+  }
+  FileRow row;
+  check(reader.next_row(row, error) && row.values.size() == 2 && row.values[0] == "1"
+        && row.values[1].empty() && !row.nulls[1], "inference preserves pending first row");
+
+  options.has_header = true;
+  options.quote = '\'';
+  options.delimiter = '|';
+  options.escape = '\\';
+  options.null_string = "NULL";
+  write_file(path, "a|b|c|d\r\n'it\\'s'|'a''b'|'NULL'|NULL\r\n");
+  FileCsvReader custom;
+  check(custom.open(path, options).is_ok(), "custom-quote CSV opens");
+  check(custom.infer_schema(schema).is_ok(), "custom-quote schema infers");
+  if (custom.next_row(row, error) && row.values.size() == 4) {
+    check_eq_str(row.values[0], "it's", "escape precedes custom quote");
+    check_eq_str(row.values[1], "a'b", "custom doubled quote decodes");
+    check(!row.nulls[2] && row.nulls[3], "quoted null marker stays literal");
+  } else {
+    check(false, "custom quoted row reads");
+  }
+
+  options = FileReadOptions();
+  write_file(path, "a\n\"a\\\\b\\\"c\"\n");
+  FileCsvReader escaped;
+  check(escaped.open(path, options).is_ok() && escaped.next_row(row, error)
+        && row.values[0] == "a\\b\"c", "default escape handles backslash and quote in forward order");
+  options.escape = options.quote;
+  write_file(path, "a\n\"a\"\"b\"\n");
+  FileCsvReader same_escape;
+  check(same_escape.open(path, options).is_ok() && same_escape.next_row(row, error)
+        && row.values[0] == "a\"b", "quote-as-escape handles doubled quote");
+  options = FileReadOptions();
+  write_file(path, "\"bad header");
+  FileCsvReader bad_header;
+  check(bad_header.open(path, options).code() == FileErrorCode::PARSE_ERROR,
+        "unterminated header reports parse error at open");
+  const char *bad[] = {"\"unterminated", "\"ok\"garbage", "\"ok\" ", "\"dangling\\"};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+    write_file(path, std::string("a\n") + bad[i]);
+    FileCsvReader malformed;
+    check(malformed.open(path, options).is_ok(), "malformed data allows valid header open");
+    error = malformed.infer_schema(schema);
+    check(error.code() == FileErrorCode::PARSE_ERROR, "malformed quoted CSV inference errors");
+    check(!malformed.next_row(row, error) && error.code() == FileErrorCode::PARSE_ERROR,
+          "malformed quoted CSV iteration errors rather than EOF");
+    error = malformed.scan([](const FileRow &) { return true; });
+    check(error.code() == FileErrorCode::PARSE_ERROR, "malformed quoted CSV callback scan errors");
+  }
+  options.max_field_size = 3;
+  const char *oversize[] = {"abcd", "\"abcd\"", "\"\"\"\"\"\"\"\"\"\"", "\"\r\n\r\n\r\n\r\n\""};
+  for (size_t i = 0; i < sizeof(oversize) / sizeof(oversize[0]); ++i) {
+    write_file(path, std::string("a\n") + oversize[i]);
+    FileCsvReader limited;
+    check(limited.open(path, options).is_ok(), "limited CSV opens header");
+    check(limited.infer_schema(schema).code() == FileErrorCode::LIMIT_EXCEEDED,
+          "oversize CSV field inference errors rather than truncating");
+    check(!limited.next_row(row, error) && error.code() == FileErrorCode::LIMIT_EXCEEDED,
+          "oversize CSV field iteration errors");
+  }
+  write_file(path, "a\n\"abc\"\n");
+  FileCsvReader exact;
+  check(exact.open(path, options).is_ok() && exact.infer_schema(schema).is_ok(),
+        "field exactly at byte limit succeeds");
+  // Exercise escaped/doubled quotes at the 64 KiB refill boundary.
+  options.max_field_size = 100000;
+  const std::string prefix(65532, 'x');
+  write_file(path, "a\n\"" + prefix + "\"\"z\"\n");
+  FileCsvReader boundary;
+  check(boundary.open(path, options).is_ok() && boundary.next_row(row, error)
+        && row.values[0] == prefix + "\"z", "doubled quote spanning buffer refill decodes");
+}
+
+void test_json_regressions(const std::string &dir)
+{
+  std::vector<std::string> keys;
+  std::vector<JsonFieldValue> values;
+  std::string error;
+  const char *bad_numbers[] = {"-", "+1", "01", "-01", ".1", "1.", "1e", "1e+", "1e-",
+                               "1-2", "1+2", "1..2", "--1", "NaN", "Infinity"};
+  for (size_t i = 0; i < sizeof(bad_numbers) / sizeof(bad_numbers[0]); ++i) {
+    check(!parse_flat_json_object(std::string("{\"n\":") + bad_numbers[i] + "}", keys, values, error),
+          std::string("invalid JSON number rejected: ") + bad_numbers[i]);
+  }
+  const char *numbers[] = {"0", "-0", "123", "-123", "0.1", "-0.1", "1e10", "1E+10", "1e-10"};
+  for (size_t i = 0; i < sizeof(numbers) / sizeof(numbers[0]); ++i) {
+    check(parse_flat_json_object(std::string("{\"n\":") + numbers[i] + "}", keys, values, error),
+          std::string("valid JSON number accepted: ") + numbers[i]);
+  }
+  for (int c = 0; c < 32; ++c) {
+    check(!parse_flat_json_object(std::string("{\"s\":\"") + static_cast<char>(c) + "\"}", keys, values, error),
+          "raw JSON string controls rejected");
+    check(!parse_flat_json_object(std::string("{\"") + static_cast<char>(c) + "\":1}", keys, values, error),
+          "raw JSON key controls rejected");
+  }
+  check(parse_flat_json_object("{\"\\uD83D\\uDE00\":\"\\uD834\\uDD1E\\u20ac\\u0000\"}", keys, values, error),
+        "UTF16 surrogate pairs and BMP escapes parse");
+  if (keys.size() == 1 && values.size() == 1) {
+    check_eq_str(keys[0], "\xF0\x9F\x98\x80", "supplementary Unicode key encodes as UTF8");
+    check_eq_str(values[0].text, std::string("\xF0\x9D\x84\x9E\xE2\x82\xAC\0", 8),
+                 "supplementary Unicode and NUL encode as UTF8");
+  }
+  const char *surrogates[] = {"\\uD800", "\\uDC00", "\\uD800x", "\\uD800\\u0041",
+                              "\\uD800\\uD800", "\\uD800\\uZZZZ", "\\uD800\\uDC0"};
+  for (size_t i = 0; i < sizeof(surrogates) / sizeof(surrogates[0]); ++i) {
+    check(!parse_flat_json_object(std::string("{\"s\":\"") + surrogates[i] + "\"}", keys, values, error),
+          "lone or malformed JSON surrogate rejects");
+  }
+  const std::string path = dir + "/json_regression.jsonl";
+  write_file(path, "{}\n\n{\"late\":1,\"empty\":\"\"}\n{\"late\":2,\"empty\":\"\"}\n");
+  FileJsonlReader reader;
+  FileReadOptions options;
+  FileSchema schema;
+  check(reader.open(path, options).is_ok() && reader.infer_schema(schema).is_ok(), "late union schema infers");
+  check(schema.columns.size() == 2 && schema.columns[0].nullable && schema.columns[1].nullable,
+        "late union columns are nullable for previously missing rows");
+  if (schema.columns.size() == 2) {
+    check(schema.columns[1].type == ColumnType::VARCHAR, "JSON empty string infers VARCHAR");
+  }
+}
+
+void test_reader_limits_and_changes(const std::string &dir)
+{
+  const std::string csv_path = dir + "/csv_regression.csv";
+  const std::string json_path = dir + "/json_regression.jsonl";
+  FileReadOptions options;
+  options.max_row_count = 1;
+  write_file(csv_path, "a\n1\n2\n");
+  write_file(json_path, "{\"a\":1}\n{\"a\":2}\n");
+  FileCsvReader csv;
+  FileJsonlReader json;
+  FileSchema schema;
+  FileRow row;
+  FileSourceError error;
+  check(csv.open(csv_path, options).is_ok() && json.open(json_path, options).is_ok(),
+        "row-limited readers open");
+  check(csv.infer_schema(schema).code() == FileErrorCode::LIMIT_EXCEEDED,
+        "CSV inference rejects row budget rather than partial schema");
+  check(json.infer_schema(schema).code() == FileErrorCode::LIMIT_EXCEEDED,
+        "JSON inference rejects row budget rather than partial schema");
+  check(csv.next_row(row, error) && !csv.next_row(row, error)
+        && error.code() == FileErrorCode::LIMIT_EXCEEDED, "CSV iteration enforces row budget");
+  check(json.next_row(row, error) && !json.next_row(row, error)
+        && error.code() == FileErrorCode::LIMIT_EXCEEDED, "JSON iteration enforces row budget");
+
+  options.max_row_count = 0;
+  check(csv.open(csv_path, options).is_ok() && json.open(json_path, options).is_ok(),
+        "change-detection readers reopen");
+  write_file(csv_path, "a\n1\n2\n3\n");
+  write_file(json_path, "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
+  check(csv.infer_schema(schema).code() == FileErrorCode::FILE_CHANGED,
+        "CSV inference rejects file changed after open");
+  check(json.infer_schema(schema).code() == FileErrorCode::FILE_CHANGED,
+        "JSON inference rejects file changed after open");
+
+  check(csv.open(csv_path, options).is_ok() && json.open(json_path, options).is_ok(),
+        "EOF change-detection readers reopen");
+  while (csv.next_row(row, error)) {}
+  check(error.is_ok(), "CSV reaches unchanged EOF");
+  while (json.next_row(row, error)) {}
+  check(error.is_ok(), "JSON reaches unchanged EOF");
+  write_file(csv_path, "a\n1\n");
+  write_file(json_path, "{\"a\":1}\n");
+  check(!csv.next_row(row, error) && error.code() == FileErrorCode::FILE_CHANGED,
+        "CSV checks file identity even at EOF");
+  check(!json.next_row(row, error) && error.code() == FileErrorCode::FILE_CHANGED,
+        "JSON checks file identity even at EOF");
+}
+
+void test_secure_path(const std::string &dir)
 {
   std::string error;
+  std::string canonical_dir;
+  check(canonical_path(dir, canonical_dir), "test fixture directory canonicalizes");
+  const std::string existing = canonical_dir + "/basic.csv";
   // an empty secure_file_priv denies every access
   check(!check_secure_path("", "/tmp/a.csv", error), "an empty secure_file_priv denies the access");
   // "/" allows every absolute path
-  check(check_secure_path("/", "/tmp/a.csv", error), "the root secure_file_priv allows every path");
+  check(check_secure_path("/", existing, error), "the root secure_file_priv allows every path");
   // the path has to be located below the configured directory
-  check(check_secure_path("/tmp/allowed", "/tmp/allowed/a.csv", error), "a path below the directory is allowed");
+  check(check_secure_path(canonical_dir, existing, error), "a path below the directory is allowed");
   check(!check_secure_path("/tmp/allowed", "/tmp/other/a.csv", error), "a path outside of the directory is denied");
   // the path traversal is rejected
   check(!check_secure_path("/tmp/allowed", "/tmp/allowed/../other/a.csv", error),
@@ -382,7 +603,7 @@ void test_glob(const std::string &dir)
 
   // the glob reader reports every file as one row with a single file column
   FileSourceReader reader;
-  error = reader.open_glob(dir + "/*");
+  error = reader.open_glob(dir + "/*", "/");
   check(error.is_ok(), "the glob reader is opened: " + error.message());
   FileSchema schema;
   error = reader.infer_schema(schema);
@@ -451,13 +672,17 @@ int main(int argc, char **argv)
   write_file(dir + "/simple.parquet", base64_decode(parquet_fixture));
 
   test_type_inference();
-  test_secure_path();
+  test_secure_path(dir);
   test_extension();
   test_csv(dir);
   test_jsonl(dir);
   test_parquet(dir);
   test_glob(dir);
   test_unsupported_format(dir);
+  test_inference_boundaries();
+  test_csv_regressions(dir);
+  test_json_regressions(dir);
+  test_reader_limits_and_changes(dir);
 
   std::cout << "[INFO] " << (g_checked - g_failed) << "/" << g_checked << " checks passed" << std::endl;
   if (0 != g_failed) {

@@ -130,6 +130,7 @@ struct ObSelectIntoItem
         buffer_size_(DEFAULT_BUFFER_SIZE),
         external_properties_(),
         write_header_(false),
+        is_copy_(false),
         null_str_(),
         column_names_()
   {
@@ -159,6 +160,7 @@ struct ObSelectIntoItem
     buffer_size_ = other.buffer_size_;
     external_properties_ = other.external_properties_;
     write_header_ = other.write_header_;
+    is_copy_ = other.is_copy_;
     null_str_ = other.null_str_;
     int ret = user_vars_.assign(other.user_vars_);
     if (OB_SUCC(ret)) {
@@ -198,6 +200,7 @@ struct ObSelectIntoItem
   common::ObString external_properties_;
   // whether the first line of the exported file holds the column names
   bool write_header_;
+  bool is_copy_; // COPY-specific CSV and failure atomicity; not SELECT INTO.
   // the text which represents a null value in the exported file
   common::ObString null_str_;
   // the column names of the exported query result

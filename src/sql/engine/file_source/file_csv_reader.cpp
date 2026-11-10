@@ -40,9 +40,10 @@ public:
 
   FileSourceError open(const std::string &path)
   {
-    file_ = std::fopen(path.c_str(), "rb");
-    if (NULL == file_) {
-      return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot open file '" + path + "'");
+    FileSignature signature;
+    FileSourceError error = open_regular_file(path, options_.secure_file_priv, file_, signature);
+    if (!error.is_ok()) {
+      return error;
     }
     buffer_.resize(kReadBufferSize);
     return FileSourceError();
@@ -57,13 +58,15 @@ public:
   }
 
   bool is_open() const { return NULL != file_; }
+  const FileSourceError &error() const { return error_; }
+  bool signature(FileSignature &signature) const { return get_open_file_signature(file_, signature); }
 
   /// Read the next record. Returns false when the end of the file is reached.
   bool next_record(std::vector<std::string> &fields, std::vector<bool> &quoted, int64_t &record_line)
   {
     fields.clear();
     quoted.clear();
-    if (eof_) {
+    if (eof_ || !error_.is_ok()) {
       return false;
     }
     record_line = line_;
@@ -72,6 +75,9 @@ public:
       bool field_quoted = false;
       std::string field;
       const bool has_field = read_field(field, field_quoted);
+      if (!error_.is_ok()) {
+        return false;
+      }
       if (has_field) {
         has_content = true;
       }
@@ -137,10 +143,13 @@ private:
     if (c < 0) {
       return false;
     }
-    if ('"' == c && options_.quote == c) {
+    if (options_.quote == c) {
       is_quoted = true;
       ++pos_;
       read_quoted_field(field);
+      if (!error_.is_ok()) {
+        return false;
+      }
       // the closing quote may be followed by the delimiter or the end of the record
       const int after = peek();
       if (after >= 0 && options_.delimiter == after) {
@@ -155,6 +164,9 @@ private:
           ++pos_;
         }
         ++line_;
+      } else if (after >= 0) {
+        error_ = FileSourceError(FileErrorCode::PARSE_ERROR,
+                                 "unexpected content after closing CSV quote", line_);
       }
     } else {
       read_plain_field(field);
@@ -162,44 +174,43 @@ private:
     return true;
   }
 
+  bool append_char(std::string &field, char c)
+  {
+    if (static_cast<int64_t>(field.size()) >= options_.max_field_size) {
+      error_ = FileSourceError(FileErrorCode::LIMIT_EXCEEDED,
+                               "the CSV field size limit was exceeded", line_);
+      return false;
+    }
+    field.push_back(c);
+    return true;
+  }
+
   void read_quoted_field(std::string &field)
   {
     while (true) {
-      const int c = next_char();
+      int c = next_char();
       if (c < 0) {
-        // unterminated quoted field, the remaining content is used as is
+        error_ = FileSourceError(FileErrorCode::PARSE_ERROR, "unterminated quoted CSV field", line_);
         return;
       }
-      if ('"' == c) {
-        const int next = peek();
-        if (options_.quote == next) {
-          field.push_back('"');
-          ++pos_;
-          continue;
+      if (options_.quote == c) {
+        if (options_.quote != peek()) {
+          return;
         }
-        if (options_.escape != options_.quote && options_.escape == next) {
+        ++pos_;  // doubled quotes are accepted with any escape option
+      } else if (options_.escape != options_.quote && options_.escape == c
+                 && (options_.quote == peek() || options_.escape == peek())) {
+        // The escape precedes the quoted character, not the other way round.
+        c = next_char();
+      } else if ('\r' == c) {
+        if ('\n' == peek()) {
           ++pos_;
-          const int escaped = next_char();
-          if (escaped >= 0) {
-            field.push_back(static_cast<char>(escaped));
-          }
-          continue;
         }
+        ++line_;
+        c = '\n';
+      }
+      if (!append_char(field, static_cast<char>(c))) {
         return;
-      }
-      if ('\r' == c) {
-        // normalize CRLF inside quoted fields
-        const int next = peek();
-        if ('\n' == next) {
-          ++pos_;
-          ++line_;
-        }
-        field.push_back('\n');
-        continue;
-      }
-      field.push_back(static_cast<char>(c));
-      if (static_cast<int64_t>(field.size()) > options_.max_field_size) {
-        break;
       }
     }
   }
@@ -231,8 +242,7 @@ private:
         break;
       }
       ++pos_;
-      field.push_back(static_cast<char>(c));
-      if (static_cast<int64_t>(field.size()) > options_.max_field_size) {
+      if (!append_char(field, static_cast<char>(c))) {
         break;
       }
     }
@@ -240,6 +250,7 @@ private:
 
 private:
   FileReadOptions options_;
+  FileSourceError error_;
   FILE *file_ = NULL;
   std::vector<char> buffer_;
   size_t pos_ = 0;
@@ -284,6 +295,8 @@ FileCsvReader::~FileCsvReader()
 
 FileSourceError FileCsvReader::open(const std::string &path, const FileReadOptions &options)
 {
+  opened_ = false;
+  rows_read_ = 0;
   path_ = path;
   options_ = options;
   if (!get_file_signature(path_, signature_)) {
@@ -308,8 +321,12 @@ FileSourceError FileCsvReader::open(const std::string &path, const FileReadOptio
   int64_t record_line = 0;
   if (!tokenizer_->next_record(fields, quoted, record_line)) {
     tokenizer_->close();
+    if (!tokenizer_->error().is_ok()) {
+      return tokenizer_->error();
+    }
     return FileSourceError(FileErrorCode::PARSE_ERROR, "file '" + path + "' is empty");
   }
+  header_.clear();
   if (options_.has_header) {
     build_unique_column_names(fields, header_);
   } else {
@@ -331,7 +348,9 @@ FileSourceError FileCsvReader::check_unchanged() const
   if (!get_file_signature(path_, current)) {
     return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot stat file '" + path_ + "'");
   }
-  if (!(current == signature_)) {
+  FileSignature opened_signature;
+  if (!(current == signature_) || (NULL != tokenizer_ && tokenizer_->is_open()
+      && (!tokenizer_->signature(opened_signature) || !(opened_signature == signature_)))) {
     return FileSourceError(FileErrorCode::FILE_CHANGED, "file '" + path_ + "' changed during the scan");
   }
   return FileSourceError();
@@ -340,7 +359,11 @@ FileSourceError FileCsvReader::check_unchanged() const
 FileSourceError FileCsvReader::infer_schema(FileSchema &schema)
 {
   Tokenizer tokenizer(options_);
-  FileSourceError error = tokenizer.open(path_);
+  FileSourceError error = check_unchanged();
+  if (!error.is_ok()) {
+    return error;
+  }
+  error = tokenizer.open(path_);
   if (!error.is_ok()) {
     return error;
   }
@@ -349,8 +372,12 @@ FileSourceError FileCsvReader::infer_schema(FileSchema &schema)
   int64_t record_line = 0;
   if (!tokenizer.next_record(fields, quoted, record_line)) {
     tokenizer.close();
+    if (!tokenizer.error().is_ok()) {
+      return tokenizer.error();
+    }
     return FileSourceError(FileErrorCode::PARSE_ERROR, "file '" + path_ + "' is empty");
   }
+  header_.clear();
   if (options_.has_header) {
     build_unique_column_names(fields, header_);
   } else {
@@ -378,7 +405,7 @@ FileSourceError FileCsvReader::infer_schema(FileSchema &schema)
     for (int64_t i = 0; i < column_count; ++i) {
       const std::string &value = fields[static_cast<size_t>(i)];
       const bool is_quoted = quoted[static_cast<size_t>(i)];
-      const bool is_null = (!options_.null_string.empty() && value == options_.null_string)
+      const bool is_null = (!is_quoted && !options_.null_string.empty() && value == options_.null_string)
                            || (!is_quoted && value.empty());
       if (is_null) {
         accumulators[static_cast<size_t>(i)].feed_null();
@@ -388,10 +415,14 @@ FileSourceError FileCsvReader::infer_schema(FileSchema &schema)
     }
     ++row_count;
     if (options_.max_row_count > 0 && row_count > options_.max_row_count) {
-      break;
+      tokenizer.close();
+      return FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "the row limit of the file scan was exceeded");
     }
   }
   tokenizer.close();
+  if (!tokenizer.error().is_ok()) {
+    return tokenizer.error();
+  }
   schema.columns.clear();
   for (int64_t i = 0; i < column_count; ++i) {
     FileColumn column;
@@ -401,13 +432,17 @@ FileSourceError FileCsvReader::infer_schema(FileSchema &schema)
     schema.columns.push_back(column);
   }
   schema_ = schema;
-  return FileSourceError();
+  return check_unchanged();
 }
 
 FileSourceError FileCsvReader::scan_rows(const FileRowCallback &callback, bool collect_only)
 {
   Tokenizer tokenizer(options_);
-  FileSourceError error = tokenizer.open(path_);
+  FileSourceError error = check_unchanged();
+  if (!error.is_ok()) {
+    return error;
+  }
+  error = tokenizer.open(path_);
   if (!error.is_ok()) {
     return error;
   }
@@ -417,6 +452,9 @@ FileSourceError FileCsvReader::scan_rows(const FileRowCallback &callback, bool c
   if (options_.has_header) {
     if (!tokenizer.next_record(fields, quoted, record_line)) {
       tokenizer.close();
+      if (!tokenizer.error().is_ok()) {
+        return tokenizer.error();
+      }
       return FileSourceError(FileErrorCode::PARSE_ERROR, "file '" + path_ + "' is empty");
     }
   }
@@ -435,7 +473,7 @@ FileSourceError FileCsvReader::scan_rows(const FileRowCallback &callback, bool c
     for (int64_t i = 0; i < column_count; ++i) {
       const std::string &value = fields[static_cast<size_t>(i)];
       const bool is_quoted = quoted[static_cast<size_t>(i)];
-      const bool is_null = (!options_.null_string.empty() && value == options_.null_string)
+      const bool is_null = (!is_quoted && !options_.null_string.empty() && value == options_.null_string)
                            || (!is_quoted && value.empty());
       row.values.push_back(value);
       row.nulls.push_back(is_null);
@@ -450,7 +488,7 @@ FileSourceError FileCsvReader::scan_rows(const FileRowCallback &callback, bool c
     }
   }
   tokenizer.close();
-  return FileSourceError();
+  return tokenizer.error().is_ok() ? check_unchanged() : tokenizer.error();
 }
 
 bool FileCsvReader::next_row(FileRow &row, FileSourceError &error)
@@ -468,7 +506,7 @@ bool FileCsvReader::next_row(FileRow &row, FileSourceError &error)
     record_line = pending_line_;
     has_pending_ = false;
   } else if (!tokenizer_->next_record(fields, quoted, record_line)) {
-    error = FileSourceError();
+    error = tokenizer_->error().is_ok() ? check_unchanged() : tokenizer_->error();
     return false;
   }
   const int64_t column_count = static_cast<int64_t>(header_.size());
@@ -478,12 +516,16 @@ bool FileCsvReader::next_row(FileRow &row, FileSourceError &error)
                             record_line);
     return false;
   }
+  if (options_.max_row_count > 0 && ++rows_read_ > options_.max_row_count) {
+    error = FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "the row limit of the file scan was exceeded");
+    return false;
+  }
   row.values.clear();
   row.nulls.clear();
   for (int64_t i = 0; i < column_count; ++i) {
     const std::string &value = fields[static_cast<size_t>(i)];
     const bool is_quoted = quoted[static_cast<size_t>(i)];
-    const bool is_null = (!options_.null_string.empty() && value == options_.null_string)
+    const bool is_null = (!is_quoted && !options_.null_string.empty() && value == options_.null_string)
                          || (!is_quoted && value.empty());
     row.values.push_back(value);
     row.nulls.push_back(is_null);

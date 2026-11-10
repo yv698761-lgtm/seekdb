@@ -72,6 +72,7 @@ public:
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
       write_header_(false),
+        is_copy_(false),
       null_str_(),
       column_names_(alloc),
       external_properties_(alloc)
@@ -95,6 +96,7 @@ public:
   bool is_overwrite_;
   // whether the first line of the exported file holds the column names
   bool write_header_;
+  bool is_copy_; // COPY-specific CSV and failure atomicity; not SELECT INTO.
   // the text which represents a null value in the exported file
   common::ObString null_str_;
   // the column names of the exported query result
@@ -146,7 +148,7 @@ public:
     ObEscapePrinter():
       enclose_(), escape_(), zero_(), field_terminator_(), line_terminator_(), convert_replacer_(),
       need_enclose_(false), do_encode_(false), do_escape_(false), print_hex_(false),
-      ignore_convert_failed_(false) {}
+      ignore_convert_failed_(false), csv_mode_(false) {}
     int operator() (const ObString &src_str, const ob_wc_t &unicode_value) {
       int ret = OB_SUCCESS;
       ObString dst_str = src_str;
@@ -162,7 +164,7 @@ public:
         }
       }
       if (OB_FAIL(ret) || !do_escape_ || print_hex_) {
-      } else if (dst_str.compare(zero_) == 0
+      } else if ((!csv_mode_ && dst_str.compare(zero_) == 0)
                  || dst_str.compare(enclose_) == 0
                  || dst_str.compare(escape_) == 0
                  || (!need_enclose_ && (dst_str.compare(field_terminator_) == 0
@@ -172,7 +174,7 @@ public:
       if (OB_FAIL(ret)) {
       } else if (print_hex_) {
         ret = hex_print(dst_str.ptr(), dst_str.length(), buf_, buf_len_, pos_);
-      } else if (do_escape_ && dst_str.compare(zero_) == 0) {
+      } else if (!csv_mode_ && do_escape_ && dst_str.compare(zero_) == 0) {
         char zero = '0';
         ret = databuff_memcpy(buf_, buf_len_, pos_, 1, &zero);
       } else {
@@ -192,6 +194,7 @@ public:
     bool do_escape_;
     bool print_hex_;
     bool ignore_convert_failed_;
+    bool csv_mode_;
     char *buf_;
     int64_t buf_len_;
     int64_t pos_;

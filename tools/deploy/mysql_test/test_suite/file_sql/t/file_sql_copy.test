@@ -1,0 +1,97 @@
+# owner: database-competition
+# owner group: SQL
+# description: COPY CSV roundtrip, defaults, custom dialect and failed output cleanup.
+# tags: sql,executor,file_sql
+
+--source mysql_test/test_suite/file_sql/include/copy_file_sql_data.inc
+--disable_query_log
+let $FILE_SQL_DATA_DIR = $OBSERVER_DIR/data_for_mysqltest_file_sql;
+set session enable_file_sql = ON;
+create table copy_csv_src(id int primary key, v varchar(200));
+insert into copy_csv_src values (1, 'a,b'), (2, concat('line', char(10), 'break')),
+ (3, 'a"b'), (4, ''), (5, 'NULL'), (6, NULL), (7, 'a|b'), (8, 'a!b');
+
+--echo # Default dialect and table source preserve all non-NULL bytes
+--disable_result_log
+# COPY must not truncate its input using sql_select_limit.
+set session sql_select_limit = 1;
+eval copy copy_csv_src to '$FILE_SQL_DATA_DIR/copy_default.csv';
+set session sql_select_limit = default;
+--enable_result_log
+eval select column1, hex(column2) as bytes, column2 is null as is_null
+ from read_csv('$FILE_SQL_DATA_DIR/copy_default.csv', header = false) order by column1;
+
+--echo # Custom delimiter, quote, escape and literal NULL marker
+--disable_result_log
+eval copy (select id, v as `v|name` from copy_csv_src order by id)
+ to '$FILE_SQL_DATA_DIR/copy_custom.csv'
+ (format csv, header, delimiter '|', quote '"', escape '!', nullstr 'NULL');
+--enable_result_log
+eval select id, hex(`v|name`) as bytes, `v|name` is null as is_null
+ from read_csv('$FILE_SQL_DATA_DIR/copy_custom.csv', delimiter = '|', escape = '!', nullstr = 'NULL') order by id;
+
+--echo # HEADER FALSE is a boolean option, not an implicit true
+--disable_result_log
+eval copy (select 'no_header' as v) to '$FILE_SQL_DATA_DIR/copy_no_header.csv' (header false);
+--enable_result_log
+eval select column1 from read_csv('$FILE_SQL_DATA_DIR/copy_no_header.csv', header = false);
+
+--echo # Custom quote and distinct escape roundtrip
+--disable_result_log
+eval copy (select 'a^b!' as v) to '$FILE_SQL_DATA_DIR/copy_quote.csv'
+ (header, delimiter ';', quote '^', escape '!');
+--enable_result_log
+eval select v from read_csv('$FILE_SQL_DATA_DIR/copy_quote.csv', delimiter = ';', quote = '^', escape = '!');
+
+--echo # Empty queries still emit an escaped header
+--disable_result_log
+eval copy (select v as `v"name` from copy_csv_src where id < 0)
+ to '$FILE_SQL_DATA_DIR/copy_empty.csv' (header);
+--enable_result_log
+eval select count(*) as empty_rows from read_csv('$FILE_SQL_DATA_DIR/copy_empty.csv');
+
+--echo # Invalid or ambiguous CSV options are rejected
+--disable_result_log
+--error 1210
+eval copy copy_csv_src to '$FILE_SQL_DATA_DIR/invalid.csv' (delimiter '||');
+--error 1210
+eval copy copy_csv_src to '$FILE_SQL_DATA_DIR/invalid.csv' (delimiter '"');
+--error 1210
+eval copy copy_csv_src to '$FILE_SQL_DATA_DIR/invalid.csv' (nullstr 'a,b');
+--error 1149
+eval copy copy_csv_src to '$FILE_SQL_DATA_DIR/invalid.csv' (header, header);
+--enable_result_log
+
+--echo # Existing destination is rejected and left intact
+--disable_result_log
+--error 1086
+eval copy (select 'replacement') to '$FILE_SQL_DATA_DIR/copy_custom.csv' (header);
+--enable_result_log
+eval select count(*) as preserved_rows from read_csv('$FILE_SQL_DATA_DIR/copy_custom.csv', delimiter = '|', escape = '!', nullstr = 'NULL');
+
+--echo # Query failure removes the newly created destination (retry succeeds)
+--disable_result_log
+--error 3141
+eval copy (select json_extract(v, char(36)) from copy_csv_src)
+ to '$FILE_SQL_DATA_DIR/copy_failed.csv' (header);
+eval copy (select 'retry' as v) to '$FILE_SQL_DATA_DIR/copy_failed.csv' (header);
+--enable_result_log
+eval select v from read_csv('$FILE_SQL_DATA_DIR/copy_failed.csv');
+
+--echo # Runtime gate applies to previously prepared COPY
+--disable_result_log
+eval prepare copy_cached from "copy (select 1 as id) to '$FILE_SQL_DATA_DIR/copy_cached.csv' (header)";
+set session enable_file_sql = OFF;
+--error 1235
+execute copy_cached;
+set session enable_file_sql = ON;
+execute copy_cached;
+deallocate prepare copy_cached;
+--enable_result_log
+eval select id from read_csv('$FILE_SQL_DATA_DIR/copy_cached.csv');
+--disable_result_log
+drop table copy_csv_src;
+set session enable_file_sql = OFF;
+--enable_result_log
+--enable_query_log
+--source mysql_test/test_suite/file_sql/include/remove_file_sql_data.inc

@@ -120,6 +120,30 @@ private:
     return false;
   }
 
+  bool parse_hex_quad(unsigned int &code)
+  {
+    if (pos_ + 4 > text_.size()) {
+      return false;
+    }
+    code = 0;
+    for (int i = 0; i < 4; ++i) {
+      const char h = text_[pos_++];
+      code <<= 4;
+      if (h >= '0' && h <= '9') {
+        code |= h - '0';
+      } else if (h >= 'a' && h <= 'f') {
+        code |= h - 'a' + 10;
+      } else if (h >= 'A' && h <= 'F') {
+        code |= h - 'A' + 10;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool is_digit() const { return peek() >= '0' && peek() <= '9'; }
+
   bool parse_string(std::string &out, std::string &error)
   {
     if (!expect('"')) {
@@ -131,6 +155,10 @@ private:
       const char c = text_[pos_++];
       if ('"' == c) {
         return true;
+      }
+      if (static_cast<unsigned char>(c) < 0x20) {
+        error = "unescaped control character in the JSON string";
+        return false;
       }
       if ('\\' != c) {
         out.push_back(c);
@@ -150,33 +178,39 @@ private:
         case 'r': out.push_back('\r'); break;
         case 't': out.push_back('\t'); break;
         case 'u': {
-          if (pos_ + 4 > text_.size()) {
+          unsigned int code = 0;
+          if (!parse_hex_quad(code)) {
             error = "invalid unicode escape in the JSON string";
             return false;
           }
-          unsigned int code = 0;
-          for (int i = 0; i < 4; ++i) {
-            const char h = text_[pos_++];
-            code <<= 4;
-            if (h >= '0' && h <= '9') {
-              code |= static_cast<unsigned int>(h - '0');
-            } else if (h >= 'a' && h <= 'f') {
-              code |= static_cast<unsigned int>(h - 'a' + 10);
-            } else if (h >= 'A' && h <= 'F') {
-              code |= static_cast<unsigned int>(h - 'A' + 10);
-            } else {
-              error = "invalid unicode escape in the JSON string";
+          if (code >= 0xD800 && code <= 0xDBFF) {
+            if (!expect('\\') || !expect('u')) {
+              error = "missing low surrogate in the JSON string";
               return false;
             }
+            unsigned int low = 0;
+            if (!parse_hex_quad(low) || low < 0xDC00 || low > 0xDFFF) {
+              error = "invalid low surrogate in the JSON string";
+              return false;
+            }
+            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+          } else if (code >= 0xDC00 && code <= 0xDFFF) {
+            error = "lone low surrogate in the JSON string";
+            return false;
           }
-          // encode the code point as UTF-8
+          // encode the Unicode scalar value as UTF-8
           if (code < 0x80) {
             out.push_back(static_cast<char>(code));
           } else if (code < 0x800) {
             out.push_back(static_cast<char>(0xC0 | (code >> 6)));
             out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-          } else {
+          } else if (code < 0x10000) {
             out.push_back(static_cast<char>(0xE0 | (code >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+          } else {
+            out.push_back(static_cast<char>(0xF0 | (code >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
           }
@@ -229,22 +263,35 @@ private:
       value.text.clear();
       return true;
     }
-    // number
+    // JSON number: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
     const size_t begin = pos_;
-    if ('-' == c) {
-      ++pos_;
-    }
-    while (pos_ < text_.size()) {
-      const char n = text_[pos_];
-      if ((n >= '0' && n <= '9') || '.' == n || 'e' == n || 'E' == n || '+' == n || '-' == n) {
-        ++pos_;
-        continue;
+    expect('-');
+    if (expect('0')) {
+      if (is_digit()) {
+        error = "leading zero in JSON number";
+        return false;
       }
-      break;
+    } else {
+      if (peek() < '1' || peek() > '9') {
+        error = "invalid JSON number";
+        return false;
+      }
+      while (is_digit()) { ++pos_; }
     }
-    if (begin == pos_) {
-      error = "invalid JSON value";
-      return false;
+    if (expect('.')) {
+      if (!is_digit()) {
+        error = "missing fraction digits in JSON number";
+        return false;
+      }
+      while (is_digit()) { ++pos_; }
+    }
+    if (expect('e') || expect('E')) {
+      if (!expect('+')) { expect('-'); }
+      if (!is_digit()) {
+        error = "missing exponent digits in JSON number";
+        return false;
+      }
+      while (is_digit()) { ++pos_; }
     }
     value.text = text_.substr(begin, pos_ - begin);
     return true;
@@ -266,13 +313,15 @@ private:
 class FileJsonlReader::LineReader
 {
 public:
-  explicit LineReader(const std::string &path) : path_(path) {}
+  LineReader(const std::string &path, const std::string &secure_file_priv)
+      : path_(path), secure_file_priv_(secure_file_priv) {}
 
   FileSourceError open()
   {
-    file_ = std::fopen(path_.c_str(), "rb");
-    if (NULL == file_) {
-      return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot open file '" + path_ + "'");
+    FileSignature signature;
+    FileSourceError error = open_regular_file(path_, secure_file_priv_, file_, signature);
+    if (!error.is_ok()) {
+      return error;
     }
     buffer_.resize(64 * 1024);
     return FileSourceError();
@@ -285,6 +334,8 @@ public:
       file_ = NULL;
     }
   }
+
+  bool signature(FileSignature &signature) const { return get_open_file_signature(file_, signature); }
 
   /// Read the next line, returns false at the end of the file.
   bool next_line(std::string &line, int64_t &line_number)
@@ -334,6 +385,7 @@ private:
 
 private:
   std::string path_;
+  std::string secure_file_priv_;
   FILE *file_ = NULL;
   std::vector<char> buffer_;
   size_t pos_ = 0;
@@ -364,6 +416,9 @@ FileJsonlReader::~FileJsonlReader()
 
 FileSourceError FileJsonlReader::open(const std::string &path, const FileReadOptions &options)
 {
+  opened_ = false;
+  rows_read_ = 0;
+  column_names_.clear();
   path_ = path;
   options_ = options;
   if (!get_file_signature(path_, signature_)) {
@@ -374,7 +429,7 @@ FileSourceError FileJsonlReader::open(const std::string &path, const FileReadOpt
     delete reader_;
     reader_ = NULL;
   }
-  reader_ = new LineReader(path_);
+  reader_ = new LineReader(path_, options_.secure_file_priv);
   FileSourceError error = reader_->open();
   if (!error.is_ok()) {
     delete reader_;
@@ -391,7 +446,9 @@ FileSourceError FileJsonlReader::check_unchanged() const
   if (!get_file_signature(path_, current)) {
     return FileSourceError(FileErrorCode::FILE_NOT_FOUND, "cannot stat file '" + path_ + "'");
   }
-  if (!(current == signature_)) {
+  FileSignature opened_signature;
+  if (!(current == signature_) || (NULL != reader_
+      && (!reader_->signature(opened_signature) || !(opened_signature == signature_)))) {
     return FileSourceError(FileErrorCode::FILE_CHANGED, "file '" + path_ + "' changed during the scan");
   }
   return FileSourceError();
@@ -399,8 +456,12 @@ FileSourceError FileJsonlReader::check_unchanged() const
 
 FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
 {
-  LineReader reader(path_);
-  FileSourceError error = reader.open();
+  LineReader reader(path_, options_.secure_file_priv);
+  FileSourceError error = check_unchanged();
+  if (!error.is_ok()) {
+    return error;
+  }
+  error = reader.open();
   if (!error.is_ok()) {
     return error;
   }
@@ -408,7 +469,6 @@ FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
   std::vector<std::string> column_order;
   std::map<std::string, size_t> column_index;
   std::vector<ColumnTypeAccumulator> accumulators;
-  bool nullable = false;
   std::string line;
   int64_t line_number = 0;
   int64_t row_count = 0;
@@ -440,12 +500,15 @@ FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
         column_index[keys[i]] = idx;
         column_order.push_back(keys[i]);
         accumulators.push_back(ColumnTypeAccumulator());
+        if (row_count > 0) {
+          // A newly discovered union column was absent from every prior row.
+          accumulators.back().feed_null();
+        }
       } else {
         idx = it->second;
       }
       if (values[i].is_null) {
         accumulators[idx].feed_null();
-        nullable = true;
       } else {
         accumulators[idx].feed_value(values[i].text);
       }
@@ -461,12 +524,12 @@ FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
       }
       if (!present) {
         accumulators[i].feed_null();
-        nullable = true;
       }
     }
     ++row_count;
     if (options_.max_row_count > 0 && row_count > options_.max_row_count) {
-      break;
+      reader.close();
+      return FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "the row limit of the file scan was exceeded");
     }
   }
   reader.close();
@@ -480,13 +543,17 @@ FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
   }
   column_names_ = column_order;
   schema_ = schema;
-  return FileSourceError();
+  return check_unchanged();
 }
 
 FileSourceError FileJsonlReader::scan_rows(const FileRowCallback &callback, bool collect_only)
 {
-  LineReader reader(path_);
-  FileSourceError error = reader.open();
+  LineReader reader(path_, options_.secure_file_priv);
+  FileSourceError error = check_unchanged();
+  if (!error.is_ok()) {
+    return error;
+  }
+  error = reader.open();
   if (!error.is_ok()) {
     return error;
   }
@@ -542,7 +609,7 @@ FileSourceError FileJsonlReader::scan_rows(const FileRowCallback &callback, bool
     }
   }
   reader.close();
-  return FileSourceError();
+  return check_unchanged();
 }
 
 bool FileJsonlReader::next_row(FileRow &row, FileSourceError &error)
@@ -572,6 +639,10 @@ bool FileJsonlReader::next_row(FileRow &row, FileSourceError &error)
       error = FileSourceError(FileErrorCode::NOT_SUPPORTED, parse_error, line_number);
       return false;
     }
+    if (options_.max_row_count > 0 && ++rows_read_ > options_.max_row_count) {
+      error = FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "the row limit of the file scan was exceeded");
+      return false;
+    }
     if (column_names_.empty()) {
       column_names_ = keys;
     }
@@ -597,7 +668,7 @@ bool FileJsonlReader::next_row(FileRow &row, FileSourceError &error)
     error = FileSourceError();
     return true;
   }
-  error = FileSourceError();
+  error = check_unchanged();
   return false;
 }
 

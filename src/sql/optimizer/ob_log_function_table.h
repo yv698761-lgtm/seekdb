@@ -35,6 +35,8 @@ public:
         file_has_header_(-1),
         file_sample_size_(-1),
         file_delimiter_(0),
+        file_quote_('"'),
+        file_escape_('\\'),
         file_describe_(false),
         file_null_string_(),
         access_exprs_() { }
@@ -71,10 +73,16 @@ public:
   inline void set_file_sample_size(int64_t file_sample_size) { file_sample_size_ = file_sample_size; }
   inline int32_t get_file_delimiter() const { return file_delimiter_; }
   inline void set_file_delimiter(int32_t file_delimiter) { file_delimiter_ = file_delimiter; }
+  inline int32_t get_file_quote() const { return file_quote_; }
+  inline void set_file_quote(int32_t value) { file_quote_ = value; }
+  inline int32_t get_file_escape() const { return file_escape_; }
+  inline void set_file_escape(int32_t value) { file_escape_ = value; }
   inline bool get_file_describe() const { return file_describe_; }
   inline void set_file_describe(bool file_describe) { file_describe_ = file_describe; }
   inline const common::ObString &get_file_null_string() const { return file_null_string_; }
   inline void set_file_null_string(const common::ObString &file_null_string) { file_null_string_ = file_null_string; }
+  inline const common::ObString &get_file_schema_fingerprint() const { return file_schema_fingerprint_; }
+  inline void set_file_schema_fingerprint(const common::ObString &fingerprint) { file_schema_fingerprint_ = fingerprint; }
   virtual int get_plan_item_info(PlanText &plan_text, 
                                 ObSqlPlanItem &plan_item) override;
 private:
@@ -87,8 +95,11 @@ private:
   int32_t file_has_header_;
   int64_t file_sample_size_;
   int32_t file_delimiter_;
+  int32_t file_quote_;
+  int32_t file_escape_;
   bool file_describe_;
   common::ObString file_null_string_;
+  common::ObString file_schema_fingerprint_;
   common::ObSEArray<ObRawExpr*, 4, common::ModulePageAllocator, true> access_exprs_;
   DISALLOW_COPY_AND_ASSIGN(ObLogFunctionTable);
 };

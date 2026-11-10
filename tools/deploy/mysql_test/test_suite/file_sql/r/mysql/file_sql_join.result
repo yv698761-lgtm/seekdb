@@ -1,0 +1,23 @@
+# Cross-format INNER JOIN
+id	name	score
+2	Bob	NULL
+3	Chen	90
+# LEFT JOIN keeps the unmatched row
+id	name
+1	Alice
+2	Bob
+3	NULL
+# Cross-format Parquet JOIN and projected columns
+c1	name
+1	Alice
+2	Bob
+3	Chen
+# Aggregate, HAVING, expression, sorting and LIMIT
+active	n	total
+1	2	4
+doubled	label
+6	CHEN
+# Self cross JOIN must support independent cursors and rescan
+pairs	total
+9	36
+# sample_size must be exactly negative one

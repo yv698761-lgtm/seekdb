@@ -3101,86 +3101,124 @@ int ObSelectResolver::resolve_copy_format(const ParseNode *format_node,
                                           ObSelectIntoItem &into_item)
 {
   int ret = OB_SUCCESS;
-  bool has_format = false;
-  bool write_header = false;
-  ObString format_name;
+  ObString delimiter = ObString::make_string(",");
+  ObString quote = ObString::make_string("\"");
+  ObString escape;
   ObString null_str;
+  bool has_escape = false;
+  bool write_header = false;
+  uint64_t seen = 0;
   for (int i = 0; OB_SUCC(ret) && i < format_node->num_child_; ++i) {
     ParseNode *option_node = format_node->children_[i];
     if (OB_ISNULL(option_node) || T_COPY_OPTION != option_node->type_
         || option_node->num_child_ < 1 || OB_ISNULL(option_node->children_[0])) {
       ret = OB_ERR_PARSER_SYNTAX;
-      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "invalid copy option");
       break;
     }
-    ObString option_name = option_node->children_[0]->str_value_;
-    bool has_value = false;
-    ObString option_value;
-    if (option_node->num_child_ > 1 && OB_NOT_NULL(option_node->children_[1])) {
-      option_value = option_node->children_[1]->str_value_;
-      has_value = true;
+    ObString name = option_node->children_[0]->str_value_;
+    bool has_value = option_node->num_child_ > 1 && OB_NOT_NULL(option_node->children_[1]);
+    ObString value = has_value ? ObString(option_node->children_[1]->str_value_) : ObString();
+    if (has_value && T_BOOL == option_node->children_[1]->type_) {
+      value = ObString::make_string(option_node->children_[1]->value_ ? "true" : "false");
     }
-    if (is_same_copy_option(option_name, "format")) {
-      if (!has_value) {
-        // the value of the format option may be a bare identifier, e.g. 'format csv'
-        if (i + 1 < format_node->num_child_) {
-          ParseNode *value_node = format_node->children_[i + 1];
-          if (OB_NOT_NULL(value_node) && T_COPY_OPTION == value_node->type_
-              && value_node->num_child_ == 1 && OB_NOT_NULL(value_node->children_[0])) {
-            ObString value_name = value_node->children_[0]->str_value_;
-            if (is_same_copy_option(value_name, "csv")
-                || is_same_copy_option(value_name, "json")
-                || is_same_copy_option(value_name, "parquet")) {
-              option_value = value_name;
-              has_value = true;
-              // the bare identifier has been consumed as the value of the format option
-              ++i;
-            }
-          }
-        }
-        if (!has_value) {
-          ret = OB_ERR_PARSER_SYNTAX;
-          LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "copy option format needs a value");
-          break;
+    int option_id = -1;
+    if (is_same_copy_option(name, "__copy")) {
+      continue; // parser-generated marker for COPY with default options
+    } else if (is_same_copy_option(name, "format")) {
+      option_id = 0;
+      // The grammar represents bare FORMAT CSV as two option nodes.
+      if (!has_value && i + 1 < format_node->num_child_) {
+        ParseNode *next = format_node->children_[i + 1];
+        if (OB_NOT_NULL(next) && T_COPY_OPTION == next->type_
+            && next->num_child_ == 1 && OB_NOT_NULL(next->children_[0])) {
+          value = next->children_[0]->str_value_;
+          has_value = true;
+          ++i;
         }
       }
-      has_format = true;
-      format_name = option_value;
-    } else if (is_same_copy_option(option_name, "header")) {
-      write_header = true;
-    } else if (is_same_copy_option(option_name, "nullstr")
-               || is_same_copy_option(option_name, "null_string")) {
-      if (!has_value) {
-        ret = OB_ERR_PARSER_SYNTAX;
-        LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "copy option nullstr needs a value");
-        break;
+      if (has_value && !is_same_copy_option(value, "csv")) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY format other than CSV");
       }
-      null_str = option_value;
+    } else if (is_same_copy_option(name, "header")) {
+      option_id = 1;
+      if (!has_value || is_same_copy_option(value, "true") || value == "1") {
+        write_header = true;
+      } else if (is_same_copy_option(value, "false") || value == "0") {
+        write_header = false;
+      } else {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    } else if (is_same_copy_option(name, "delimiter") || is_same_copy_option(name, "delim")) {
+      option_id = 2;
+      delimiter = value;
+    } else if (is_same_copy_option(name, "quote")) {
+      option_id = 3;
+      quote = value;
+    } else if (is_same_copy_option(name, "escape")) {
+      option_id = 4;
+      escape = value;
+      has_escape = true;
+    } else if (is_same_copy_option(name, "nullstr") || is_same_copy_option(name, "null_string")) {
+      option_id = 5;
+      null_str = value;
     } else {
       ret = OB_ERR_PARSER_SYNTAX;
-      LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "unsupported copy option");
+    }
+    if (OB_SUCC(ret)) {
+      if (option_id < 0 || (seen & (1ULL << option_id)) || (option_id != 1 && !has_value)) {
+        ret = OB_ERR_PARSER_SYNTAX;
+        LOG_USER_ERROR(OB_ERR_PARSER_SYNTAX, "invalid or duplicate COPY option");
+      } else {
+        seen |= 1ULL << option_id;
+      }
     }
   }
-  if (OB_SUCC(ret) && has_format && !is_same_copy_option(format_name, "csv")) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "this format type");
+  if (!has_escape) {
+    escape = quote;
   }
   if (OB_SUCC(ret)) {
-    // the exported file is a plain csv file: the fields are separated by ',', the
-    // lines are terminated by '\n' and neither the enclose char nor the escape
-    // char is used, so the values are printed as they are.
-    into_item.field_str_.set_varchar(",");
-    into_item.field_str_.set_collation_type(ObCharset::get_system_collation());
-    into_item.line_str_.set_varchar("\n");
-    into_item.line_str_.set_collation_type(ObCharset::get_system_collation());
-    into_item.closed_cht_.set_char_value(NULL, 0);
-    into_item.escaped_cht_.set_char_value(NULL, 0);
-    into_item.is_optional_ = false;
+    // The CSV scanner/writer use single-byte structural characters. Never
+    // silently truncate a multibyte character or accept ambiguous structure.
+    if (delimiter.length() != 1 || quote.length() != 1 || escape.length() != 1
+        || delimiter.ptr()[0] == quote.ptr()[0]
+        || delimiter.ptr()[0] == escape.ptr()[0]) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+    const ObString chars[] = {delimiter, quote, escape};
+    for (int i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      const unsigned char ch = chars[i].ptr()[0];
+      if (ch == 0 || ch == '\r' || ch == '\n' || ch >= 0x80) {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    }
+    // NULL is unquoted, so its marker must itself be a valid unquoted field.
+    for (int i = 0; OB_SUCC(ret) && i < null_str.length(); ++i) {
+      if (null_str.ptr()[i] == '\r' || null_str.ptr()[i] == '\n'
+          || null_str.ptr()[i] == delimiter.ptr()[0] || null_str.ptr()[i] == quote.ptr()[0]) {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    }
   }
   if (OB_SUCC(ret)) {
-    into_item.write_header_ = write_header;
-    if (!null_str.empty()
-        && OB_FAIL(ob_write_string(*allocator_, null_str, into_item.null_str_))) {
+    ObString owned_delimiter;
+    ObString owned_quote;
+    ObString owned_escape;
+    if (OB_FAIL(ob_write_string(*allocator_, delimiter, owned_delimiter))
+        || OB_FAIL(ob_write_string(*allocator_, quote, owned_quote))
+        || OB_FAIL(ob_write_string(*allocator_, escape, owned_escape))
+        || OB_FAIL(ob_write_string(*allocator_, null_str, into_item.null_str_))) {
+    } else {
+      into_item.is_copy_ = true;
+      into_item.write_header_ = write_header;
+      into_item.field_str_.set_varchar(owned_delimiter);
+      into_item.field_str_.set_collation_type(ObCharset::get_system_collation());
+      into_item.line_str_.set_varchar("\n");
+      into_item.line_str_.set_collation_type(ObCharset::get_system_collation());
+      into_item.closed_cht_.set_char_value(owned_quote.ptr(), owned_quote.length());
+      into_item.escaped_cht_.set_char_value(owned_escape.ptr(), owned_escape.length());
+      // Quoting every non-NULL cell preserves empty strings and literal NULL markers.
+      into_item.is_optional_ = false;
     }
   }
   return ret;

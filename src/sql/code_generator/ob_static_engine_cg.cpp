@@ -5494,6 +5494,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.parallel_ = op.get_parallel();
       spec.is_overwrite_ = op.get_is_overwrite();
       spec.write_header_ = op.get_write_header();
+      spec.is_copy_ = op.get_is_copy();
       if (OB_FAIL(ob_write_string(alloc, op.get_null_str(), spec.null_str_))) {
         ret = OB_ERR_UNEXPECTED;
       }
@@ -5526,11 +5527,15 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
       // the file table function scans a local file
       if (OB_FAIL(ob_write_string(alloc, op.get_file_path(), spec.file_path_))) {
       } else if (OB_FAIL(ob_write_string(alloc, op.get_file_null_string(), spec.file_null_string_))) {
+      } else if (OB_FAIL(ob_write_string(alloc, op.get_file_schema_fingerprint(),
+                                               spec.file_schema_fingerprint_))) {
       } else {
         spec.file_format_ = op.get_file_format();
         spec.file_has_header_ = op.get_file_has_header();
         spec.file_sample_size_ = op.get_file_sample_size();
         spec.file_delimiter_ = op.get_file_delimiter();
+        spec.file_quote_ = op.get_file_quote();
+        spec.file_escape_ = op.get_file_escape();
         spec.file_describe_ = op.get_file_describe();
       }
     }
@@ -5538,6 +5543,10 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
       if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs().at(i)))) {
       }
     }
+    if (op.is_file_table()) {
+      OZ (spec.file_column_indices_.init(op.get_stmt()->get_column_size()));
+    }
+    int64_t file_column_index = 0;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_stmt()->get_column_size(); ++i) {
       ObExpr *rt_expr = nullptr;
       const ColumnItem *col_item = op.get_stmt()->get_column_item(i);
@@ -5545,10 +5554,16 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
       CK (OB_NOT_NULL(col_item->expr_));
       if (OB_SUCC(ret)
           && col_item->table_id_ == op.get_table_id()
-          && (op.is_file_table() || col_item->expr_->is_explicited_reference())) {
+          && col_item->expr_->is_explicited_reference()) {
         OZ (mark_expr_self_produced(col_item->expr_));
         OZ (generate_rt_expr(*col_item->expr_, rt_expr));
         OZ (spec.column_exprs_.push_back(rt_expr));
+        if (op.is_file_table()) {
+          OZ (spec.file_column_indices_.push_back(file_column_index));
+        }
+      }
+      if (col_item->table_id_ == op.get_table_id()) {
+        ++file_column_index;
       }
     }
   }

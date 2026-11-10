@@ -66,6 +66,7 @@ int ObSelectIntoItem::deep_copy(ObIAllocator &allocator,
   } else if (OB_FAIL(ob_write_string(allocator, other.null_str_, null_str_))) {
   } else {
     write_header_ = other.write_header_;
+    is_copy_ = other.is_copy_;
     for (int64_t i = 0; OB_SUCC(ret) && i < other.column_names_.count(); ++i) {
       common::ObString column_name;
       if (OB_FAIL(ob_write_string(allocator, other.column_names_.at(i), column_name))) {

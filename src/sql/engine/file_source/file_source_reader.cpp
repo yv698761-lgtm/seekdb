@@ -172,8 +172,12 @@ FileSourceError FileSourceReader::list_files(const std::string &pattern, std::ve
   return FileSourceError();
 }
 
-FileSourceError FileSourceReader::open_glob(const std::string &pattern)
+FileSourceError FileSourceReader::open_glob(const std::string &pattern, const std::string &secure_file_priv)
 {
+  std::string reason;
+  if (!check_secure_path(secure_file_priv, pattern, reason)) {
+    return FileSourceError(FileErrorCode::PATH_NOT_ALLOWED, reason);
+  }
   path_ = pattern;
   format_ = FileFormat::GLOB;
   is_glob_ = true;
@@ -181,6 +185,12 @@ FileSourceError FileSourceReader::open_glob(const std::string &pattern)
   FileSourceError error = list_files(pattern, glob_files_);
   if (!error.is_ok()) {
     return error;
+  }
+  for (size_t i = 0; i < glob_files_.size(); ++i) {
+    if (!check_secure_path(secure_file_priv, glob_files_[i], reason)) {
+      glob_files_.clear();
+      return FileSourceError(FileErrorCode::PATH_NOT_ALLOWED, reason);
+    }
   }
   opened_ = true;
   return FileSourceError();

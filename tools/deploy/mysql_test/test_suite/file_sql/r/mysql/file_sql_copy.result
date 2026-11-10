@@ -1,0 +1,39 @@
+# Default dialect and table source preserve all non-NULL bytes
+column1	bytes	is_null
+1	612C62	0
+2	6C696E650A627265616B	0
+3	612262	0
+4		0
+5	4E554C4C	0
+6	NULL	1
+7	617C62	0
+8	612162	0
+# Custom delimiter, quote, escape and literal NULL marker
+id	bytes	is_null
+1	612C62	0
+2	6C696E650A627265616B	0
+3	612262	0
+4		0
+5	4E554C4C	0
+6	NULL	1
+7	617C62	0
+8	612162	0
+# HEADER FALSE is a boolean option, not an implicit true
+column1
+no_header
+# Custom quote and distinct escape roundtrip
+v
+a^b!
+# Empty queries still emit an escaped header
+empty_rows
+0
+# Invalid or ambiguous CSV options are rejected
+# Existing destination is rejected and left intact
+preserved_rows
+8
+# Query failure removes the newly created destination (retry succeeds)
+v
+retry
+# Runtime gate applies to previously prepared COPY
+id
+1

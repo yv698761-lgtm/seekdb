@@ -34,6 +34,7 @@ public:
   ObExternalFileWriter():
     write_bytes_(0),
     is_file_opened_(false),
+    owns_file_(false),
     file_appender_(),
     split_file_id_(0),
     url_()
@@ -44,6 +45,7 @@ public:
   int open_file();
   virtual int close_file();
   int close_data_writer();
+  int abort_file();
   virtual int write_file() = 0;
   virtual int64_t get_file_size() = 0;
   int64_t get_write_bytes() { return write_bytes_; }
@@ -52,6 +54,7 @@ protected:
   int64_t write_bytes_;
 public:
   bool is_file_opened_;
+  bool owns_file_; // set only after successful exclusive creation
   ObFileAppender file_appender_;
   int64_t split_file_id_;
   ObString url_;
