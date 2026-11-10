@@ -313,8 +313,10 @@ private:
 class FileJsonlReader::LineReader
 {
 public:
-  LineReader(const std::string &path, const std::string &secure_file_priv)
-      : path_(path), secure_file_priv_(secure_file_priv) {}
+  LineReader(const std::string &path, const std::string &secure_file_priv,
+             int64_t max_line_size = 64 * 1024 * 1024)
+      : path_(path), secure_file_priv_(secure_file_priv),
+        max_line_size_(max_line_size > 0 ? static_cast<size_t>(max_line_size) : 0) {}
 
   FileSourceError open()
   {
@@ -337,10 +339,15 @@ public:
 
   bool signature(FileSignature &signature) const { return get_open_file_signature(file_, signature); }
 
+  /// True when the last next_line() call stopped because the line grew beyond
+  /// the configured bound, the caller must report a limit error in that case.
+  bool limit_exceeded() const { return limit_exceeded_; }
+
   /// Read the next line, returns false at the end of the file.
   bool next_line(std::string &line, int64_t &line_number)
   {
     line.clear();
+    limit_exceeded_ = false;
     ++line_number;
     bool any = false;
     while (true) {
@@ -356,6 +363,10 @@ public:
           line.erase(line.size() - 1);
         }
         return true;
+      }
+      if (max_line_size_ > 0 && line.size() >= max_line_size_) {
+        limit_exceeded_ = true;
+        return false;
       }
       line.push_back(c);
     }
@@ -386,6 +397,8 @@ private:
 private:
   std::string path_;
   std::string secure_file_priv_;
+  size_t max_line_size_ = 64 * 1024 * 1024;
+  bool limit_exceeded_ = false;
   FILE *file_ = NULL;
   std::vector<char> buffer_;
   size_t pos_ = 0;
@@ -429,7 +442,7 @@ FileSourceError FileJsonlReader::open(const std::string &path, const FileReadOpt
     delete reader_;
     reader_ = NULL;
   }
-  reader_ = new LineReader(path_, options_.secure_file_priv);
+  reader_ = new LineReader(path_, options_.secure_file_priv, options_.max_line_size);
   FileSourceError error = reader_->open();
   if (!error.is_ok()) {
     delete reader_;
@@ -456,7 +469,7 @@ FileSourceError FileJsonlReader::check_unchanged() const
 
 FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
 {
-  LineReader reader(path_, options_.secure_file_priv);
+  LineReader reader(path_, options_.secure_file_priv, options_.max_line_size);
   FileSourceError error = check_unchanged();
   if (!error.is_ok()) {
     return error;
@@ -532,7 +545,13 @@ FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
       return FileSourceError(FileErrorCode::LIMIT_EXCEEDED, "the row limit of the file scan was exceeded");
     }
   }
+  const bool line_limit_exceeded = reader.limit_exceeded();
   reader.close();
+  if (line_limit_exceeded) {
+    return FileSourceError(FileErrorCode::LIMIT_EXCEEDED,
+                           "a json line exceeds the maximum line size of '" + path_ + "'",
+                           line_number);
+  }
   schema.columns.clear();
   for (size_t i = 0; i < column_order.size(); ++i) {
     FileColumn column;
@@ -548,7 +567,7 @@ FileSourceError FileJsonlReader::infer_schema(FileSchema &schema)
 
 FileSourceError FileJsonlReader::scan_rows(const FileRowCallback &callback, bool collect_only)
 {
-  LineReader reader(path_, options_.secure_file_priv);
+  LineReader reader(path_, options_.secure_file_priv, options_.max_line_size);
   FileSourceError error = check_unchanged();
   if (!error.is_ok()) {
     return error;
@@ -608,7 +627,13 @@ FileSourceError FileJsonlReader::scan_rows(const FileRowCallback &callback, bool
       break;
     }
   }
+  const bool line_limit_exceeded = reader.limit_exceeded();
   reader.close();
+  if (line_limit_exceeded) {
+    return FileSourceError(FileErrorCode::LIMIT_EXCEEDED,
+                           "a json line exceeds the maximum line size of '" + path_ + "'",
+                           line_number);
+  }
   return check_unchanged();
 }
 
@@ -667,6 +692,12 @@ bool FileJsonlReader::next_row(FileRow &row, FileSourceError &error)
     }
     error = FileSourceError();
     return true;
+  }
+  if (reader_->limit_exceeded()) {
+    error = FileSourceError(FileErrorCode::LIMIT_EXCEEDED,
+                            "a json line exceeds the maximum line size of '" + path_ + "'",
+                            line_number);
+    return false;
   }
   error = check_unchanged();
   return false;

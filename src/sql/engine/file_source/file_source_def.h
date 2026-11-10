@@ -156,6 +156,9 @@ struct FileReadOptions
   std::string null_string;
   /// Maximum number of bytes a single field may occupy.
   int64_t max_field_size = 16 * 1024 * 1024;
+  /// Maximum number of bytes a single JSON line may occupy. A JSON line is
+  /// parsed as a whole, an unbounded line would defeat the streaming reader.
+  int64_t max_line_size = 64 * 1024 * 1024;
   /// Maximum number of rows a single scan may produce.
   int64_t max_row_count = 0;  // 0 means unlimited
 };

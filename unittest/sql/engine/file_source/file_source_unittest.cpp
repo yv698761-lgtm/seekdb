@@ -399,6 +399,20 @@ void test_reader_limits_and_changes(const std::string &dir)
   check(json.next_row(row, error) && !json.next_row(row, error)
         && error.code() == FileErrorCode::LIMIT_EXCEEDED, "JSON iteration enforces row budget");
 
+  FileReadOptions line_limited;
+  line_limited.max_line_size = 64;
+  write_file(json_path, std::string("{\"a\":\"") + std::string(128, 'x') + "\"}\n");
+  FileJsonlReader oversized_line;
+  check(oversized_line.open(json_path, line_limited).is_ok(), "line-limited JSON opens");
+  check(oversized_line.infer_schema(schema).code() == FileErrorCode::LIMIT_EXCEEDED,
+        "JSON inference rejects a line larger than the configured bound");
+  check(!oversized_line.next_row(row, error) && error.code() == FileErrorCode::LIMIT_EXCEEDED,
+        "JSON iteration rejects a line larger than the configured bound");
+  write_file(json_path, "{\"a\":1}\n");
+  FileJsonlReader bounded_line;
+  check(bounded_line.open(json_path, line_limited).is_ok()
+        && bounded_line.infer_schema(schema).is_ok(), "short JSON line stays under the bound");
+
   options.max_row_count = 0;
   check(csv.open(csv_path, options).is_ok() && json.open(json_path, options).is_ok(),
         "change-detection readers reopen");
