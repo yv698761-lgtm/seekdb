@@ -43,6 +43,7 @@ ObPhysicalPlan::ObPhysicalPlan(MemoryContext &mem_context /* = CURRENT_CONTEXT *
     autoinc_params_(allocator_),
     stmt_need_privs_(allocator_),
     vars_(allocator_),
+    ai_column_read_refs_(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator_),
     sql_expression_factory_(allocator_),
     expr_op_factory_(allocator_),
     literal_stmt_type_(stmt::T_NONE),
@@ -132,6 +133,7 @@ void ObPhysicalPlan::reset()
   autoinc_params_.reset();
   stmt_need_privs_.reset();
   vars_.reset();
+  ai_column_read_refs_.reset();
   sql_expression_factory_.destroy();
   expr_op_factory_.destroy();
   literal_stmt_type_ = stmt::T_NONE;

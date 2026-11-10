@@ -55,6 +55,8 @@ public:
   const static uint8_t IS_JSON_CONSTRAINT_STRICT = 4;
   inline bool is_resolve_insert_update() { return is_resolve_insert_update_;}
 protected:
+  int is_ai_managed_column(const TableItem &table, const ColumnItem &column, bool &managed);
+  int check_ai_column_assignment(const TableItem &table, const ColumnItem &column);
 
   int resolve_assignments(const ParseNode &parse_node,
                           common::ObIArray<ObTableAssignment> &table_assigns,

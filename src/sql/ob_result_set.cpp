@@ -27,6 +27,7 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/engine/table/ob_table_scan_op.h"
 #include "share/ob_ddl_checksum.h"
+#include "sql/engine/ai_column_strict_read.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -150,6 +151,11 @@ OB_INLINE int ObResultSet::open_plan()
         if (OB_UNLIKELY(my_session_.is_zombie())) {
           //session has been killed some moment ago
           ret = OB_ERR_SESSION_INTERRUPTED;
+        } else if (OB_ISNULL(get_exec_context().get_sql_ctx()) ||
+                   OB_ISNULL(get_exec_context().get_sql_ctx()->schema_guard_)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(AiColumnStrictRead::check(my_session_,
+                   *get_exec_context().get_sql_ctx()->schema_guard_, *physical_plan_))) {
         } else {
           if (OB_SUCC(ret)) {
             do {

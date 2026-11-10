@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_create_table_resolver.h"
+#include "share/schema/ai_column_schema.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -892,6 +893,38 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           ObColumnNameHashWrapper name_key(hidden_col.get_column_name_str());
           if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
           }
+        }
+      }
+    }
+
+    // AI columns are ordinary stored result columns, with separately persisted
+    // request/state/spec columns. Resolve after all user columns so forward
+    // references have the same name resolution as ordinary generated columns.
+    for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+      ParseNode *element = node->children_[i];
+      if (element->type_ == T_COLUMN_DEFINITION && element->value_ == 0x414943) {
+        ObColumnSchemaV2 named;
+        ObSEArray<ObColumnSchemaV2, 3> hidden;
+        uint64_t next_id = cur_column_id_;
+        if (OB_FAIL(resolve_column_name(named, element))) {
+        } else {
+          ObColumnSchemaV2 *result = table_schema.get_column_schema(named.get_column_name_str());
+          if (nullptr == result) { ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(resolve_ai_column(*element, table_schema, *result, next_id, hidden))) {}
+          for (int64_t j = 0; OB_SUCC(ret) && j < hidden.count(); ++j) {
+            if (OB_FAIL(table_schema.add_column(hidden.at(j)))) {}
+          }
+          cur_column_id_ = next_id;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObSEArray<AiColumnDefinition, 4> definitions;
+      if (OB_FAIL(AiColumnSchema::get_definitions(table_schema, definitions))) {}
+      for (int64_t i = 0; OB_SUCC(ret) && i < definitions.count(); ++i) {
+        const auto &ids = definitions.at(i).dependency_column_ids_;
+        for (int64_t j = 0; OB_SUCC(ret) && j < ids.count(); ++j) {
+          if (AiColumnSchema::is_ai_column(table_schema, ids.at(j))) { ret = OB_NOT_SUPPORTED; }
         }
       }
     }

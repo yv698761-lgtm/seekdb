@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
+#include "sql/engine/ai_column_strict_read.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -2405,6 +2406,10 @@ int ObSql::generate_plan(ParseResult &parse_result,
     }
 
     if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(sql_ctx.schema_guard_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(AiColumnStrictRead::collect(*stmt, *sql_ctx.schema_guard_,
+                       *phy_plan))) {
     } else if (OB_FAIL(transform_stmt(&stmt->get_query_ctx()->sql_schema_guard_,
                                       opt_stat_mgr_,
                                       &self_addr_,
@@ -2520,6 +2525,10 @@ int ObSql::generate_stmt_with_reconstruct_sql(ObDMLStmt* &stmt,
     } else if (OB_ISNULL(basic_stmt) || !basic_stmt->is_dml_stmt()) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FALSE_IT(stmt = static_cast<ObDMLStmt*>(basic_stmt))) {
+    } else if (OB_ISNULL(sql_ctx.schema_guard_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(AiColumnStrictRead::collect(*stmt, *sql_ctx.schema_guard_,
+                       *phy_plan))) {
     } else if (OB_FAIL(transform_stmt(&stmt->get_query_ctx()->sql_schema_guard_,
                                       opt_stat_mgr_,
                                       &self_addr_,

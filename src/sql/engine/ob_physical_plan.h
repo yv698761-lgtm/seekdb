@@ -83,6 +83,8 @@ public:
   void set_contains_assignment(bool v) {is_contains_assignment_ = v;}
   int set_vars(const common::ObIArray<ObVarInfo> &vars);
   const common::ObIArray<ObVarInfo> &get_vars() const { return vars_; }
+  common::ObIArray<uint64_t> &get_ai_column_read_refs() { return ai_column_read_refs_; }
+  const common::ObIArray<uint64_t> &get_ai_column_read_refs() const { return ai_column_read_refs_; }
   /**
    *
    * @param[in] table_row_count_list  An array of row counts for tables involved in the plan, used solely to eliminate plans based on changes in table row counts
@@ -415,6 +417,8 @@ private:
   share::schema::ObStmtNeedPrivs stmt_need_privs_;
   // Involved system variables and user variables
   common::ObFixedArray<ObVarInfo, common::ObIAllocator> vars_;
+  // Coordinator-local original resolved (table ID, AI column ID) pairs.
+  common::ObSEArray<uint64_t, 4, common::ObIAllocator &> ai_column_read_refs_;
   ObSqlExpressionFactory sql_expression_factory_;
   ObExprOperatorFactory expr_op_factory_;
   stmt::StmtType literal_stmt_type_; // meaning reference ObBasicStmt corresponding definition
