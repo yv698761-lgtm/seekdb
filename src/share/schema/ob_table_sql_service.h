@@ -65,6 +65,11 @@ public:
                            const common::ObString *ddl_stmt_str = NULL,
                            const bool sync_schema_version_for_last_table = true,
                            const bool is_truncate_table = false);
+  // Reconcile tenant-local AI metadata in the caller's DDL transaction.
+  int sync_ai_column_metadata(common::ObISQLClient &sql_client,
+                              const ObTableSchema &table_schema);
+  int delete_ai_column_metadata(common::ObISQLClient &sql_client,
+                                const ObTableSchema &table_schema);
   //update table option
   int update_table_options(common::ObISQLClient &sql_client,
                           const ObTableSchema &table_schema,

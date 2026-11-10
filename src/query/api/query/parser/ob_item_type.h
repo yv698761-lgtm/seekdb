@@ -2278,6 +2278,7 @@ typedef enum ObItemType
   T_FILE_TABLE_EXPRESSION = 4921, // file table function, e.g. read_csv(...) / read_json(...) / read_parquet(...) / glob(...)
   T_FILE_TABLE_ARG = 4922, // one argument of a file table function
   T_COPY_OPTION = 4923, // one option of the COPY statement
+  T_AI_COLUMN_RETRY,
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

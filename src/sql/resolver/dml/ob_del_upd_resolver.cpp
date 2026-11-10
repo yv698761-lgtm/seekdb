@@ -24,6 +24,8 @@
 #include "sql/parser/parse_malloc.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/das/ob_domain_id.h"
+#include "share/schema/ai_column_schema.h"
+#include "sql/engine/dml/ob_ai_column_dml.h"
 
 namespace oceanbase
 {
@@ -68,6 +70,45 @@ ObDelUpdResolver::ObDelUpdResolver(ObResolverParams &params)
 ObDelUpdResolver::~ObDelUpdResolver()
 {
   // TODO Auto-generated destructor stub
+}
+
+int ObDelUpdResolver::is_ai_managed_column(const TableItem &table,
+                                              const ColumnItem &column,
+                                              bool &managed)
+{
+  int ret = OB_SUCCESS;
+  managed = false;
+  const ObTableSchema *schema = NULL;
+  const uint64_t table_id = column.base_tid_ != OB_INVALID_ID
+      ? column.base_tid_ : table.get_base_table_item().ref_id_;
+  const uint64_t column_id = column.base_cid_ != OB_INVALID_ID
+      ? column.base_cid_ : column.column_id_;
+  ObSEArray<AiColumnDefinition, 4> definitions;
+  if (AiColumnDml::is_internal()) {
+  } else if (OB_FAIL(schema_checker_->get_table_schema(table_id, schema))) {
+  } else if (OB_ISNULL(schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(AiColumnSchema::get_definitions(*schema, definitions))) {
+  } else {
+    for (int64_t i = 0; !managed && i < definitions.count(); ++i) {
+      const AiColumnDefinition &def = definitions.at(i);
+      managed = column_id == def.column_id_ || column_id == def.state_column_id_
+          || column_id == def.request_column_id_ || column_id == def.result_spec_column_id_;
+    }
+  }
+  return ret;
+}
+
+int ObDelUpdResolver::check_ai_column_assignment(const TableItem &table, const ColumnItem &column)
+{
+  int ret = OB_SUCCESS;
+  bool managed = false;
+  if (OB_FAIL(is_ai_managed_column(table, column, managed))) {
+  } else if (managed) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning a value to an AI managed column");
+  }
+  return ret;
 }
 
 int ObDelUpdResolver::resolve_assignments(const ParseNode &parse_node,
@@ -118,6 +159,8 @@ int ObDelUpdResolver::resolve_assignments(const ParseNode &parse_node,
             }
           }
         }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(check_ai_column_assignment(*table, *column))) {
       }
       if (OB_SUCC(ret) && T_INSERT_SCOPE == scope) {
         if (OB_FAIL(mock_values_column_ref(ref_expr))) {
@@ -2170,7 +2213,14 @@ int ObDelUpdResolver::resolve_insert_columns(const ParseNode *node,
       } else if (!session_info_->get_ddl_info().is_ddl() && OB_HIDDEN_SESS_CREATE_TIME_COLUMN_ID == column_expr->get_column_id()) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "specify __sess_create_time value");
-      } else if (OB_FAIL(mock_values_column_ref(column_expr))) {
+      } else {
+        const ColumnItem *column = del_upd_stmt->get_column_item_by_id(
+            column_expr->get_table_id(), column_expr->get_column_id());
+        if (OB_ISNULL(column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(check_ai_column_assignment(*table_item, *column))) {
+        } else if (OB_FAIL(mock_values_column_ref(column_expr))) {
+        }
       }
     }//end for
   } else {
@@ -2194,7 +2244,12 @@ int ObDelUpdResolver::resolve_insert_columns(const ParseNode *node,
       for (int64_t i = 0; OB_SUCC(ret) && i < N; i++) {
         uint64_t column_id = column_items.at(i).column_id_;
         bool is_duplicate = false;
-        if (OB_FAIL(check_insert_column_duplicate(column_id, is_duplicate))) {
+        bool ai_managed = false;
+        if (OB_FAIL(is_ai_managed_column(*table_item, column_items.at(i), ai_managed))) {
+        } else if (ai_managed) {
+          // AI outputs and their hidden control columns are filled internally,
+          // not positional user inputs for INSERT without a column list.
+        } else if (OB_FAIL(check_insert_column_duplicate(column_id, is_duplicate))) {
         } else if (is_duplicate) {
           ret = OB_ERR_FIELD_SPECIFIED_TWICE;
           ObCStringHelper helper;

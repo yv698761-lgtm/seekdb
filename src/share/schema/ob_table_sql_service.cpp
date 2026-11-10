@@ -19,6 +19,7 @@
 #include "lib/literals/ob_literals.h"
 #include "share/ob_global_stat_proxy.h"
 #include "share/schema/ob_constraint.h"
+#include "share/schema/ai_column_schema.h"
 #include "share/schema/ob_partition_sql_helper.h"
 #include "share/ob_timezone_mgr.h"
 
@@ -29,6 +30,84 @@ namespace share
 {
 namespace schema
 {
+
+int ObTableSqlService::delete_ai_column_metadata(ObISQLClient &sql_client,
+                                                   const ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  if (table.is_user_table()) {
+    ObSqlString sql;
+    int64_t affected_rows = 0;
+    const uint64_t table_id = ObSchemaUtils::get_extract_schema_id(table.get_table_id());
+    if (OB_FAIL(sql.append_fmt("DELETE FROM %s WHERE table_id = %lu",
+                              OB_ALL_AI_COLUMN_TASK_TNAME, table_id))) {
+    } else if (OB_FAIL(sql_client.write(sql.ptr(), affected_rows))) {
+    } else {
+      sql.reset();
+      if (OB_FAIL(sql.append_fmt("DELETE FROM %s WHERE table_id = %lu",
+                                OB_ALL_AI_COLUMN_TNAME, table_id))) {
+      } else if (OB_FAIL(sql_client.write(sql.ptr(), affected_rows))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::sync_ai_column_metadata(ObISQLClient &sql_client,
+                                                 const ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  if (!table.is_user_table()) {
+    // Inner-table bootstrap must not depend on the AI tables already existing.
+  } else if (table.is_in_recyclebin()) {
+    ret = delete_ai_column_metadata(sql_client, table);
+  } else {
+    ObSEArray<AiColumnDefinition, 4> definitions;
+    ObSqlString sql;
+    int64_t affected_rows = 0;
+    const uint64_t table_id = ObSchemaUtils::get_extract_schema_id(table.get_table_id());
+    if (OB_FAIL(AiColumnSchema::get_definitions(table, definitions))) {
+      LOG_WARN("failed to decode AI column definitions", K(ret), K(table_id));
+    } else if (OB_FAIL(sql.append_fmt("DELETE FROM %s WHERE table_id = %lu",
+                                     OB_ALL_AI_COLUMN_TNAME, table_id))) {
+    } else if (OB_FAIL(sql_client.write(sql.ptr(), affected_rows))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < definitions.count(); ++i) {
+      const AiColumnDefinition &def = definitions.at(i);
+      ObDMLSqlSplicer dml;
+      ObDMLExecHelper exec(sql_client);
+      if (OB_FAIL(dml.add_pk_column("table_id", table_id))
+          || OB_FAIL(dml.add_pk_column("column_id", def.column_id_))
+          || OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(def.column_name_)))
+          || OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(def.model_name_)))
+          || OB_FAIL(dml.add_column("prompt_expr", ObHexEscapeSqlStr(def.prompt_expr_)))
+          || OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(def.normalized_expr_)))
+          || OB_FAIL(dml.add_column("max_retries", def.max_retries_))
+          || OB_FAIL(dml.add_column("state_column_id", def.state_column_id_))
+          || OB_FAIL(dml.add_column("request_column_id", def.request_column_id_))
+          || OB_FAIL(dml.add_column("result_spec_column_id", def.result_spec_column_id_))
+          || OB_FAIL(dml.add_column("definition_version", def.definition_version_))
+          || OB_FAIL(dml.add_column("is_embedding", def.is_embedding_ ? 1 : 0))
+          || OB_FAIL(exec.exec_insert(OB_ALL_AI_COLUMN_TNAME, dml, affected_rows))) {
+        LOG_WARN("failed to persist AI column definition", K(ret), K(table_id), K(i));
+      }
+    }
+    // Dropped/redefined columns must not leave runnable work. Retain requests for
+    // unchanged definitions, including across unrelated ALTER TABLE operations.
+    if (OB_SUCC(ret)) {
+      sql.reset();
+      if (OB_FAIL(sql.append_fmt(
+          "DELETE FROM %s WHERE table_id = %lu AND NOT EXISTS "
+          "(SELECT 1 FROM %s d WHERE d.table_id = %s.table_id "
+          "AND d.column_id = %s.column_id AND d.definition_version = %s.definition_version)",
+          OB_ALL_AI_COLUMN_TASK_TNAME, table_id, OB_ALL_AI_COLUMN_TNAME,
+          OB_ALL_AI_COLUMN_TASK_TNAME, OB_ALL_AI_COLUMN_TASK_TNAME, OB_ALL_AI_COLUMN_TASK_TNAME))) {
+      } else if (OB_FAIL(sql_client.write(sql.ptr(), affected_rows))) {
+      }
+    }
+  }
+  return ret;
+}
 
 int ObTableSqlService::exec_update(
     ObISQLClient &sql_client,
@@ -697,6 +776,9 @@ int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
     }
   }
 
+  if (OB_SUCC(ret) && OB_FAIL(delete_ai_column_metadata(sql_client, table_schema))) {
+    LOG_WARN("failed to remove AI column metadata", K(ret), K(table_id));
+  }
   // delete from __all_table_stat, __all_monitor_modified, __all_column_usage, __all_optstat_user_prefs
   if (OB_SUCC(ret)) {
     if (OB_FAIL(delete_from_all_table_stat(sql_client, table_id))) {
@@ -1680,6 +1762,9 @@ int ObTableSqlService::add_table(
     }
   }
 
+  if (OB_SUCC(ret) && OB_FAIL(sync_ai_column_metadata(sql_client, table))) {
+    LOG_WARN("failed to synchronize AI column metadata", K(ret), K(table));
+  }
   return ret;
 }
 
@@ -2163,6 +2248,7 @@ int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
       for (int64_t i = 0; i < tables.count() && OB_SUCC(ret); i++) {
         if (is_inner_table(tables.at(i).get_table_id())) {
         } else if (OB_FAIL(add_foreign_key(sql_client, tables.at(i), false/*only_history*/))) {
+        } else if (OB_FAIL(sync_ai_column_metadata(sql_client, tables.at(i)))) {
         }
       }
       time_guard.click("add_foreign_key");

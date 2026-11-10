@@ -551,6 +551,11 @@ protected:
       const ParseNode &skip_index_node,
       share::schema::ObColumnSchemaV2 &column_schema);
   int check_skip_index(share::schema::ObTableSchema &table_schema);
+  int resolve_ai_column(const ParseNode &node, const share::schema::ObTableSchema &source,
+      share::schema::ObColumnSchemaV2 &result, uint64_t &next_id,
+      common::ObIArray<share::schema::ObColumnSchemaV2> &hidden);
+  int resolve_ai_dependencies(const ParseNode &node, const share::schema::ObTableSchema &source,
+      common::ObIArray<uint64_t> &ids);
   int resolve_lob_inrow_threshold(const ParseNode *option_node, const bool is_index_option);
 
   int resolve_lob_storage_parameters(const ParseNode *node);

@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_update_resolver.h"
+#include "share/schema/ai_column_schema.h"
 
 namespace oceanbase
 {
@@ -342,6 +343,7 @@ int ObUpdateResolver::generate_update_table_info(ObTableAssignment &table_assign
   uint64_t index_tid[OB_MAX_AUX_TABLE_PER_MAIN_TABLE];
   int64_t gindex_cnt = OB_MAX_AUX_TABLE_PER_MAIN_TABLE;
   int64_t binlog_row_image = ObBinlogRowImage::FULL;
+  ObSEArray<AiColumnDefinition, 4> ai_definitions;
   if (OB_ISNULL(schema_checker_) || OB_ISNULL(params_.session_info_) ||
       OB_ISNULL(allocator_) || OB_ISNULL(update_stmt)) {
     ret = OB_ERR_UNEXPECTED;
@@ -354,6 +356,7 @@ int ObUpdateResolver::generate_update_table_info(ObTableAssignment &table_assign
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(schema_checker_->get_can_write_index_array(table_item->get_base_table_item().ref_id_,
                                                                 index_tid, gindex_cnt, true))) {
+  } else if (OB_FAIL(AiColumnSchema::get_definitions(*table_schema, ai_definitions))) {
   } else if (OB_FAIL(params_.session_info_->get_binlog_row_image(binlog_row_image))) {
   } else if (NULL == (ptr = allocator_->alloc(sizeof(ObUpdateTableInfo)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -363,7 +366,9 @@ int ObUpdateResolver::generate_update_table_info(ObTableAssignment &table_assign
     } else if (OB_FAIL(table_info->part_ids_.assign(table_item->get_base_table_item().part_ids_))) {
     } else {
       if (OB_FAIL(add_all_rowkey_columns_to_stmt(*table_item, table_info->column_exprs_))) {
-      } else if (need_all_columns(*table_schema, binlog_row_image)) {
+      } else if (!ai_definitions.empty() || need_all_columns(*table_schema, binlog_row_image)) {
+        // The AI after-row hook compares dependency values in the old/new
+        // image, including dependencies untouched by this assignment list.
         if (OB_FAIL(add_all_columns_to_stmt(*table_item, table_info->column_exprs_))) {
         }
       } else {

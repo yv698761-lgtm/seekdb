@@ -57,8 +57,36 @@ select id,
        label is not null as other_ai_column_unchanged
 from ai_column_retry_strict.docs order by id;
 
+# Compile and cache while strict mode is OFF: execution must still preflight
+# after switching the session flag, including binary/text prepared executions.
+prepare strict_cached from 'select result from ai_column_retry_strict.docs where id = 2';
+execute strict_cached;
 # Strict mode checks only AI columns actually referenced by the statement.
 set session ai_column_strict_read = on;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+execute strict_cached;
+deallocate prepare strict_cached;
+# Optimizer elimination and empty output do not change syntactic references.
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select result from ai_column_retry_strict.docs where 1 = 0;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select id from ai_column_retry_strict.docs where 1 = 0 and result is null;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select id from ai_column_retry_strict.docs
+where 1 = 0 and exists (select result from ai_column_retry_strict.docs);
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select result from ai_column_retry_strict.docs limit 0;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+update ai_column_retry_strict.docs set category = category where 1 = 0 and result is null;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+delete from ai_column_retry_strict.docs where 1 = 0 and result is null;
 select id, category from ai_column_retry_strict.docs order by id;
 select count(*) = 3 as ready_label_is_readable
 from ai_column_retry_strict.docs where label is not null;

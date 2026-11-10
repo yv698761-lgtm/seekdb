@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/ob_das_utils.h"
+#include "sql/engine/dml/ob_ai_column_dml.h"
 #include "data_plane/blocksstable/ob_datum_row.h"
 #include "share/ob_server_struct.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -33,6 +34,8 @@ namespace sql
 int ObDASUtils::check_nested_sql_mutating(ObTableID ref_table_id, ObExecContext &exec_ctx, bool is_reading)
 {
   int ret = OB_SUCCESS;
+  // AI invalidation is trusted internal DML after the parent storage batch.
+  if (AiColumnDml::is_internal()) { return ret; }
   ObExecContext *cur_parent_ctx = exec_ctx.get_parent_ctx();
   //parent_das_ctx.is_fk_cascading_ = true means that
   //the direct parent node of this sql is a foreign key,

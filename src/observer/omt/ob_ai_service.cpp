@@ -53,14 +53,24 @@ int ObAiService::init()
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
+  } else if (OB_FAIL(column_worker_.init())) {
+    LOG_WARN("AI column worker initialization failed", K(ret));
   } else {
     is_inited_ = true;
   }
   return ret;
 }
 
+int ObAiService::start()
+{
+  return is_inited_ ? column_worker_.start() : OB_NOT_INIT;
+}
+void ObAiService::stop() { column_worker_.stop(); }
+void ObAiService::wait() { column_worker_.wait(); }
 void ObAiService::destroy()
 {
+  stop();
+  wait();
   is_inited_ = false;
 }
 

@@ -69,6 +69,7 @@
 #include "rootserver/ob_create_index_on_empty_table_helper.h"
 #include "share/schema/ob_schema_guard_wrapper.h"  // relocated-definition owner
 #include "share/schema/ob_table_sql_service.h"
+#include "share/schema/ai_column_schema.h"
 #include "share/schema/ob_ddl_trans_controller.h"  // relocated-definition owner
 #include "share/schema/ob_part_mgr_util.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -7773,6 +7774,33 @@ int ObDDLService::add_new_column_to_table_schema(
       alter_column_schema.set_table_id(new_table_schema.get_table_id());
       
       new_table_schema.set_max_used_column_id(max_used_column_id);
+    }
+  }
+  // The resolver may use provisional ids for ALTER ADD. Bind the persisted
+  // definition to the ids assigned by this DDL transaction, never to a stale
+  // client-side max-column-id snapshot.
+  if (OB_SUCC(ret) && AiColumnSchema::is_spec(alter_column_schema)) {
+    AiColumnDefinition definition;
+    if (OB_FAIL(AiColumnSchema::decode(alter_column_schema.get_comment_str(), definition))) {
+    } else {
+      const ObColumnSchemaV2 *result = new_table_schema.get_column_schema(definition.column_name_);
+      ObSqlString state_name, request_name, spec_name, encoded;
+      if (nullptr == result) { ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(state_name.append_fmt("__ai_state_%lu", definition.column_id_))) {
+      } else if (OB_FAIL(request_name.append_fmt("__ai_req_%lu", definition.column_id_))) {
+      } else {
+        const ObColumnSchemaV2 *state = new_table_schema.get_column_schema(state_name.string());
+        const ObColumnSchemaV2 *request = new_table_schema.get_column_schema(request_name.string());
+        if (nullptr == state || nullptr == request) { ret = OB_ERR_UNEXPECTED; }
+        else {
+          definition.column_id_ = result->get_column_id();
+          definition.state_column_id_ = state->get_column_id();
+          definition.request_column_id_ = request->get_column_id();
+          definition.result_spec_column_id_ = alter_column_schema.get_column_id();
+          if (OB_FAIL(AiColumnSchema::encode(definition, encoded))) {
+          } else if (OB_FAIL(alter_column_schema.set_comment(encoded.string()))) {}
+        }
+      }
     }
   }
   if (OB_FAIL(ret)) {
